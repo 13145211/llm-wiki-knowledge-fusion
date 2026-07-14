@@ -19,32 +19,33 @@
 (function() {
   'use strict';
 
-  // ==================== 常量 ====================
-  var STORE_PREFIX = 'qwpdf_';
-  var PANEL_ID = 'qw-uploader-panel';
-  var DROP_OVERLAY_ID = 'qw-drop-overlay';
+  // ==================== 内部常量（一般无需修改） ====================
+  var STORE_PREFIX = 'qwpdf_';             // 油猴存储键前缀
+  var PANEL_ID = 'qw-uploader-panel';      // 控制面板元素 ID
+  var DROP_OVERLAY_ID = 'qw-drop-overlay'; // 拖拽遮罩元素 ID
 
+  // ==================== 用户可调配置（默认值，均可在面板中修改） ====================
   var DEFAULT_CONFIG = {
-    folderDisplayName: '',
-    intervalMinutes: 10,
-    fileParseWaitSeconds: 10,
-    sendDelaySeconds: 2,
-    responseTimeoutMinutes: 25,
-    responseStableSeconds: 10,
-    responseMinWaitSeconds: 20,
-    autoClearAfterComplete: false,
-    autoPrompt: true,
-    promptText: '',
-    autoSave: true,
-    cooldownMinutes: 120,
-    wakeupPrompt: 'hello',
-    uploadWaitSeconds: 5,
-    promptDoneWaitSeconds: 2,
-    presendWaitSeconds: 3,
-    activePromptTab: 0,
-    autoRotateEnabled: true,
-    scheduleStart: '',
-    scheduleEnd: ''
+    folderDisplayName: '',            // 上次所选文件夹名（自动记忆，无需手改）
+    intervalMinutes: 10,              // 上传间隔（分钟）：两篇文献之间的等待时间
+    fileParseWaitSeconds: 10,         // 文件解析等待（秒）：上传后等平台解析 PDF
+    sendDelaySeconds: 2,              // 发送延迟（秒）：Prompt 输入完成到发送
+    responseTimeoutMinutes: 25,       // 回答超时（分钟）：超过则放弃本篇
+    responseStableSeconds: 10,        // 稳定判定（秒）：回答 N 秒无变化视为生成完毕
+    responseMinWaitSeconds: 20,       // 最短等待（秒）：至少等这么久才判定完成
+    autoClearAfterComplete: false,    // 全部完成后自动清空上传记录
+    autoPrompt: true,                 // 上传后自动输入精读 Prompt
+    promptText: '',                   // 自定义 Prompt（留空 = 使用内置通用文献七段法模板）
+    autoSave: true,                   // 自动把回答下载为 .md（浏览器默认下载目录）
+    cooldownMinutes: 120,             // 冷却时间（分钟）：无效回答后暂停
+    wakeupPrompt: 'hello',            // 唤醒问题：冷却结束后先发一句日常对话
+    uploadWaitSeconds: 5,             // 上传后等待（秒）
+    promptDoneWaitSeconds: 2,         // Prompt 后等待（秒）
+    presendWaitSeconds: 3,            // 发送前等待（秒）
+    activePromptTab: 0,               // 当前激活的 Prompt 变体编号
+    autoRotateEnabled: true,          // 每篇自动轮换 Prompt 变体
+    scheduleStart: '',                // 时间窗口开始（如 '08:00'，留空不限）
+    scheduleEnd: ''                   // 时间窗口结束（如 '22:00'，留空不限）
   };
 
   var STATE = {
@@ -75,33 +76,118 @@
   }
   function gmSet(key, value) { GM_setValue(STORE_PREFIX + key, JSON.stringify(value)); }
 
+  // ==================== Prompt（通用文献七段法，2 个角色变体轮换） ====================
   var DEFAULT_PROMPT =
-'你是 WGS（水煤气变换反应）催化剂领域的博士后研究员。\n'+
-'你的任务是精读一篇催化文献，撰写 7 段结构化笔记。\n\n'+
-'你必须完全忠实地报告**文献原文和图表中的信息**——不能编造任何数字、结论或引用。\n'+
-'当文本和图像信息冲突时，以图像为准并注明矛盾。\n'+
-'如果需要推断，必须标注"合理推断"或"作者未述"。\n\n'+
-'## 1. 基本信息\n<标题/作者/机构/期刊/年份/DOI/通讯/关键词>\n\n'+
-'## 2. 研究背景与问题\n<含(1)具体科学挑战 (2)已有方案不足 (3)本文目标>\n\n'+
-'## 3. 方法/技术路线\n<制备条件(克数/温度/时间/前驱体) + 表征手段(XRD/TEM/TPR/XPS/...) + 性能测试条件>\n\n'+
-'## 4. 核心结果\n<含具体数字 + 图表引用 + 图像解读。每项结果必须注明依据来源>\n\n'+
-'## 5. 创新点\n<基于作者 abstract + conclusions 改写，用"作者报告/作者通过"+ 标"依据"。\n不得使用原文未出现的"首次/新发现/新路径"等绝对化措辞。>\n\n'+
-'## 6. 局限与展望\n<作者自陈 + 合理推断(标"合理推断"或"作者未述")>\n\n'+
-'## 7. 原始文本摘要\n<≤300 字，覆盖核心发现>\n\n'+
-'当遇到以下类型图表时，必须从图像中读取具体值：\n\n'+
-'【XRD 衍射图】读出各衍射峰 2θ 位置和晶面指数，Scherrer 晶粒尺寸与文本对比\n'+
-'【TEM/HRTEM 照片】估算颗粒尺寸范围(nm)，HRTEM 晶格条纹间距\n'+
-'【H₂-TPR 曲线】各还原峰的峰温和相对面积\n'+
-'【XPS 谱图】核实结合能标注\n'+
-'【活性曲线/Arrhenius/TOF】直接读取关键数据点，验证Eₐ值\n'+
-'【Table 数据】验证文中引用数字与表一致\n\n'+
-'完成 7 段后自检：数字反查 | 创新点clean check | 图表引用完整性 | 引号原话 | 零占位符';
+`你是 学术文献精读方向的博士后研究员。
+你的任务是精读一篇学术文献，撰写 7 段结构化笔记。
+
+你必须完全忠实地报告**文献原文和图表中的信息**——不能编造任何数字、结论或引用。
+当文本和图像信息冲突时，以图像为准并注明矛盾。
+如果需要推断，必须标注"合理推断"或"作者未述"。
+
+## 1. 基本信息
+<标题/作者/机构/期刊/年份/DOI/通讯/关键词>
+
+## 2. 研究背景与问题
+<含(1)具体科学挑战 (2)已有方案不足 (3)本文目标>
+
+## 3. 方法/技术路线
+<研究对象与材料 + 实验/计算/调查设计(条件、参数、样本量) + 分析与表征手段 + 评价指标与测试条件>
+
+## 4. 核心结果
+<含具体数字 + 图表引用 + 图像解读。每项结果必须注明依据来源>
+
+## 5. 创新点
+<基于作者 abstract + conclusions 改写，用"作者报告/作者通过"+ 标"依据"。
+不得使用原文未出现的"首次/新发现/新路径"等绝对化措辞。>
+
+## 6. 局限与展望
+<作者自陈 + 合理推断(标"合理推断"或"作者未述")>
+
+## 7. 原始文本摘要
+<≤300 字，覆盖核心发现>
+
+当遇到以下类型图表时，必须从图像中读取具体值：
+
+【谱图/衍射图/色谱类】
+- 读出特征峰的位置、强度与归属标注
+- 由峰参数计算的衍生量是否与文本一致？不一致则标注
+- 注意是否有未解释的额外峰
+
+【显微/影像类照片】
+- 目测估算特征尺寸范围，与文本声称值对比
+- 注意形貌与分布均匀性
+- 高分辨图像：读出标注的特征间距/尺度，与文本对比
+
+【性能/趋势曲线】
+- 直接读取关键数据点，验证文本中数字是否正确
+- 观察趋势拐点与异常点
+- 时间序列：检测衰减/漂移趋势
+
+【统计类图表】
+- 读取均值、误差棒、显著性标注
+- 各组差异是否支持文本中的定性判断？
+
+【拟合/回归图】
+- 读出拟合参数(斜率、截距、R² 等)
+- 验证文本中给出的参数值
+- 检查离群点
+
+【Table 数据】
+- 扫描所有表格数据，验证文中引用的数字与表一致
+- 检查脚注
+
+完成 7 段后，执行以下自检：
+1. 数字反查：所有具体数字必须在原文或图表中找到对应值
+2. 创新点 clean check：不得出现绝对化措辞除非作者原文中出现
+3. 图表引用完整性：每个 Fig/Table/Scheme 必须可见且 caption 一致
+4. 引号原话：所有双引号中的英文句子必须在原文中出现
+5. 零占位符：不得出现 TODO/TBD 等占位文本`;
+
+  var QW_PROMPT_1 =
+`你是 一位拥有 15 年跨学科经验的资深研究员（Senior Researcher）。
+请仔细阅读以下学术文献，完成一份 7 模块的结构化分析报告。
+
+核心准则：
+- 严格基于原文和图表，不做任何数值或结论的臆造
+- 图像信息优先于文本描述（遇到矛盾请明确指出）
+- 任何超出原文的推论必须标注"推测"或"文中未提及"
+
+## Module A — 文献概览
+<含完整引用信息：标题/作者/机构/期刊/年份/DOI/通讯联系人/研究关键词>
+
+## Module B — 科学问题定位
+<概述：(1)领域核心挑战 (2)现有策略的瓶颈 (3)本文的解决思路>
+
+## Module C — 研究方案
+<对象与材料 + 实验/计算/调查设计细节 + 分析与表征面板 + 评价条件>
+
+## Module D — 关键发现与数据
+<逐条列出主要发现，每条附带具体数值、对应图表编号、图像读出值。标注信息来源>
+
+## Module E — 贡献分析
+<从作者视角总结创新之处，使用"作者发现/作者证明"表述。严禁使用原文未出现的"首次/首次提出"等>
+
+## Module F — 不足与未来方向
+<作者自述的局限性 + 你的专业推测(标注"推测"或"文中未涉")>
+
+## Module G — 原文精要
+<用 ≤300 字概括核心结论，保留关键数据点>
+
+图表深度读取指引：
+【谱图类】记录特征峰位置与归属，衍生参数 vs 文本值，检查异常峰
+【显微/影像类】目估特征尺寸及分布均匀性，测量标注尺度并与文本对比
+【性能曲线】直接取关键数据点，核对文中数字，评估趋势与稳定性
+【统计图表】核读均值/误差/显著性，判断是否支持文本定性结论
+【拟合/回归图】提取拟合参数验证记载，检查异常离群数据点
+【表格】逐行扫描，核对文中所有引用数字，记录脚注条件
+
+完成后逐项核查：数值溯源 / 措辞合规 / 图表全覆盖 / 引号精确匹配 / 无占位符`;
 
   // ==================== 配置 ====================
-
   // PROMPT_POOL and rotation
-  var PROMPT_POOL = [DEFAULT_PROMPT];
-  var PROMPT_POOL_ORIG = [DEFAULT_PROMPT];
+  var PROMPT_POOL = [DEFAULT_PROMPT, QW_PROMPT_1];
+  var PROMPT_POOL_ORIG = PROMPT_POOL.slice();
   function getOriginalPrompt(idx) { return PROMPT_POOL_ORIG[idx] || DEFAULT_PROMPT; }
   function getRotatedPrompt() {
     var cfg = getConfig();
@@ -752,7 +838,7 @@
 
   function isPrompt(text) {
     if (!text) return false;
-    if (text.indexOf('你是 WGS')===0) return true;
+    if (text.indexOf('你是 ')===0) return true;
     if (text.indexOf('你是 ')===0 && text.indexOf('研究员')>5) return true;
     if (text.indexOf('<标题/作者')>=0 || text.indexOf('< 标题')>=0) return true;
     return false;

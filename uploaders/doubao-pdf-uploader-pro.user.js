@@ -21,21 +21,24 @@
 (function() {
     'use strict';
 
-    // ==================== 常量 ====================
-    const STORE_PREFIX = 'dbpdf_';
-    const DB_NAME = 'DoubaoPdfUploader';
+    // ==================== 用户可调配置（默认值，均可在面板中修改） ====================
+    const DEFAULT_INTERVAL_MINUTES = 10;        // 上传间隔（分钟）：两篇文献之间的等待时间
+    const DEFAULT_MIN_WAIT_SECONDS = 120;       // 最短等待（秒）：发送后至少等这么久才判定回答完成
+    const DEFAULT_STABLE_THRESHOLD = 10;        // 稳定判定（次）：回答文本连续 N 次（每次 2 秒）无变化视为生成完毕
+    const DEFAULT_COOLDOWN_MINUTES = 120;       // 冷却时间（分钟）：检测到无效回答后暂停这么久再继续
+    const DEFAULT_WAKEUP_PROMPT = '你好，今天天气怎么样？';  // 唤醒问题：冷却结束后先发一句日常对话再恢复上传
+    const DEFAULT_UPLOAD_WAIT_SECONDS = 5;      // 上传后等待（秒）：文件上传完成到开始输入 Prompt 的间隔
+    const DEFAULT_PROMPT_DONE_WAIT_SECONDS = 2; // Prompt 后等待（秒）：Prompt 输入完成到点击发送的间隔
+    const DEFAULT_PRESEND_WAIT_SECONDS = 3;     // 发送前等待（秒）：点击发送前的最后缓冲
+    // 注：精读笔记保存为浏览器下载（默认下载目录），文件名 = 原PDF名_文献标题.md
+
+    // ==================== 内部常量（一般无需修改） ====================
+    const STORE_PREFIX = 'dbpdf_';              // 油猴存储键前缀
+    const DB_NAME = 'DoubaoPdfUploader';        // IndexedDB 库名（记忆所选文件夹）
     const DB_VERSION = 1;
-    const DEFAULT_INTERVAL_MINUTES = 10;
-    const DEFAULT_MIN_WAIT_SECONDS = 120;
-    const DEFAULT_STABLE_THRESHOLD = 10;
-    const DEFAULT_COOLDOWN_MINUTES = 120;      // 无效回答后冷却时间
-    const DEFAULT_WAKEUP_PROMPT = '你好，今天天气怎么样？';  // 冷却后唤醒豆包的日常问题
-    const DEFAULT_UPLOAD_WAIT_SECONDS = 5;    // 上传完成后等待
-    const DEFAULT_PROMPT_DONE_WAIT_SECONDS = 2; // Prompt输入完成后等待
-    const DEFAULT_PRESEND_WAIT_SECONDS = 3;   // 发送前等待
-    const FILE_INPUT_WAIT_TIMEOUT = 10000;
-    const PANEL_ID = 'db-uploader-panel';
-    const DROP_OVERLAY_ID = 'db-drop-overlay';
+    const FILE_INPUT_WAIT_TIMEOUT = 10000;      // 查找上传入口的超时（毫秒）
+    const PANEL_ID = 'db-uploader-panel';       // 控制面板元素 ID
+    const DROP_OVERLAY_ID = 'db-drop-overlay';  // 拖拽遮罩元素 ID
 
     // ==================== 状态管理 ====================
     const STATE = {
@@ -77,10 +80,12 @@
 
     // ==================== 默认 Prompt ====================
     // ==================== Prompt 轮换池（5个变体，结构相同，措辞不同） ====================
+    // ==================== Prompt 轮换池（通用文献七段法，5 个角色变体） ====================
+    // 结构相同、措辞不同；每篇轮换使用以降低同质化。可在面板中编辑并保存。
     const PROMPT_POOL = [
-        // Prompt #0 — 博士后研究员风格（原始）
-        `你是 WGS（水煤气变换反应）催化剂领域的博士后研究员。
-你的任务是精读一篇催化文献，撰写 7 段结构化笔记。
+        // Prompt #0 — 博士后研究员（通用文献七段法）
+        `你是 学术文献精读方向的博士后研究员。
+你的任务是精读一篇学术文献，撰写 7 段结构化笔记。
 
 你必须完全忠实地报告**文献原文和图表中的信息**——不能编造任何数字、结论或引用。
 当文本和图像信息冲突时，以图像为准并注明矛盾。
@@ -93,7 +98,7 @@
 <含(1)具体科学挑战 (2)已有方案不足 (3)本文目标>
 
 ## 3. 方法/技术路线
-<制备条件(克数/温度/时间/前驱体) + 表征手段(XRD/TEM/TPR/XPS/...) + 性能测试条件>
+<研究对象与材料 + 实验/计算/调查设计(条件、参数、样本量) + 分析与表征手段 + 评价指标与测试条件>
 
 ## 4. 核心结果
 <含具体数字 + 图表引用 + 图像解读。每项结果必须注明依据来源>
@@ -110,33 +115,28 @@
 
 当遇到以下类型图表时，必须从图像中读取具体值：
 
-【XRD 衍射图】
-- 读出各衍射峰对应的 2θ 位置和晶面指数
-- 用 Scherrer 方程算出的晶粒尺寸是否与文本一致？不一致则标注
-- 注意是否有额外杂质峰
+【谱图/衍射图/色谱类】
+- 读出特征峰的位置、强度与归属标注
+- 由峰参数计算的衍生量是否与文本一致？不一致则标注
+- 注意是否有未解释的额外峰
 
-【TEM/HRTEM 照片】
-- 目测估算颗粒尺寸范围（nm），与文本声称的对比
-- 注意颗粒分布均匀性
-- HRTEM：读出晶格条纹间距，与文本标注对比
+【显微/影像类照片】
+- 目测估算特征尺寸范围，与文本声称值对比
+- 注意形貌与分布均匀性
+- 高分辨图像：读出标注的特征间距/尺度，与文本对比
 
-【H₂-TPR 曲线】
-- 读出各还原峰的峰温度和相对面积
-- 注意低温峰 vs 高温峰的归属
-- 比较各样品曲线
+【性能/趋势曲线】
+- 直接读取关键数据点，验证文本中数字是否正确
+- 观察趋势拐点与异常点
+- 时间序列：检测衰减/漂移趋势
 
-【XPS 谱图】
-- 核实结合能标注
-- 峰的相对强度是否支持文本中的定性判断？
+【统计类图表】
+- 读取均值、误差棒、显著性标注
+- 各组差异是否支持文本中的定性判断？
 
-【活性曲线（CO 转化率 vs T/时间）】
-- 直接读取关键数据点
-- 验证文本中数字是否正确
-- 稳定性曲线：检测失活趋势
-
-【Arrhenius / TOF 图】
-- 读出表观活化能
-- 验证文本中的 Eₐ 值
+【拟合/回归图】
+- 读出拟合参数(斜率、截距、R² 等)
+- 验证文本中给出的参数值
 - 检查离群点
 
 【Table 数据】
@@ -150,9 +150,9 @@
 4. 引号原话：所有双引号中的英文句子必须在原文中出现
 5. 零占位符：不得出现 TODO/TBD 等占位文本`,
 
-        // Prompt #1 — 资深研究员风格
-        `你是一位专注于非均相催化的资深科学家（Senior Scientist），拥有 15 年 DFT + 实验联合研究经验。
-请仔细阅读以下催化文献，完成一份 7 模块的结构化分析报告。
+        // Prompt #1 — 资深研究员
+        `你是 一位拥有 15 年跨学科经验的资深研究员（Senior Researcher）。
+请仔细阅读以下学术文献，完成一份 7 模块的结构化分析报告。
 
 核心准则：
 - 严格基于原文和图表，不做任何数值或结论的臆造
@@ -165,8 +165,8 @@
 ## Module B — 科学问题定位
 <概述：(1)领域核心挑战 (2)现有策略的瓶颈 (3)本文的解决思路>
 
-## Module C — 实验与计算方案
-<制备细节(前驱体/溶剂/温度/时间) + 表征面板(XRD/TEM/BET/XPS/Raman等) + 性能评价条件>
+## Module C — 研究方案
+<对象与材料 + 实验/计算/调查设计细节 + 分析与表征面板 + 评价条件>
 
 ## Module D — 关键发现与数据
 <逐条列出主要发现，每条附带具体数值、对应图表编号、图像读出值。标注信息来源>
@@ -181,19 +181,17 @@
 <用 ≤300 字概括核心结论，保留关键数据点>
 
 图表深度读取指引：
-
-【XRD】记录各衍射峰 2θ/(hkl)，Scherrer 粒径 vs 文本值，检查杂峰
-【TEM/HRTEM】目估粒径范围及分布均匀性，测量晶格条纹并与标注值对比
-【H₂-TPR】标注各还原峰 Tmax 和面积，归属低温/高温峰，跨样品比较
-【XPS】核实结合能数值，判断峰强度是否支持文本定性结论
-【活性图】从 CO 转化率-T 曲线上直接取值，核对文中数字，评估稳定性趋势
-【Arrhenius/TOF】提取 Eₐ 数值验证记载，检查异常离群数据点
+【谱图类】记录特征峰位置与归属，衍生参数 vs 文本值，检查异常峰
+【显微/影像类】目估特征尺寸及分布均匀性，测量标注尺度并与文本对比
+【性能曲线】直接取关键数据点，核对文中数字，评估趋势与稳定性
+【统计图表】核读均值/误差/显著性，判断是否支持文本定性结论
+【拟合/回归图】提取拟合参数验证记载，检查异常离群数据点
 【表格】逐行扫描，核对文中所有引用数字，记录脚注条件
 
 完成后逐项核查：数值溯源 / 措辞合规 / 图表全覆盖 / 引号精确匹配 / 无占位符`,
 
-        // Prompt #2 — 博士研究生风格
-        `你是一名催化化学专业的博士研究生，正在系统整理 WGS 反应领域的文献笔记。
+        // Prompt #2 — 博士研究生
+        `你是 一名博士研究生，正在系统整理所在领域的文献笔记。
 你的导师要求你为每篇文献生成一份标准化的 7 节精读报告。
 
 📋 报告要求：
@@ -202,6 +200,7 @@
 - 不确定的地方写"待确认"或"作者未说明"
 
 ---
+
 **第1节 · 文献卡片**
 标题 | 作者 | 单位 | 期刊(年,卷,页) | DOI | 通讯作者 | 关键词
 
@@ -211,12 +210,12 @@
 - 这篇工作想达到什么目标？
 
 **第3节 · 怎么做**
-- 催化剂制备：列出质量/温度/时间/气氛等条件
-- 表征手段：XRD、TEM、TPR、XPS、Raman 等
-- 性能评价：反应条件(GHSV/温度/压力/配比)
+- 研究对象与材料：列出关键条件与参数
+- 分析/表征手段：逐项列出
+- 评价方式：测试条件、指标、样本量
 
 **第4节 · 看到了什么**
-- 用 bullet 列出所有实验结果，每项附 Fig/Table 编号
+- 用 bullet 列出所有结果，每项附 Fig/Table 编号
 - 从图中直接读取的数据单独标注"[读图值]"
 - 与文本声称值并列对比
 
@@ -232,21 +231,21 @@
 ≤300 字，浓缩最核心的发现和数字
 
 ---
+
 🔬 图表专项分析：
-▪ XRD：记录各峰 2θ 和(hkl)，Scherrer 尺寸一致性检查
-▪ TEM：目测粒径(nm)，评估分散度，HRTEM 量取晶面间距
-▪ TPR：标峰温及面积，归属还原物种
-▪ XPS：查结合能，判断信号强度与结论的自洽性
-▪ 催化活性：从曲线上取点，与正文数值比较
-▪ Arrhenius/TOF：读 Eₐ，核对声明的活化能
+▪ 谱图类：记录特征峰位置与归属，衍生参数一致性检查
+▪ 显微/影像：目测特征尺寸，评估分布，高分辨图量取标注尺度
+▪ 性能曲线：从曲线上取点，与正文数值比较
+▪ 统计图表：读均值/误差棒/显著性，检查与结论自洽
+▪ 拟合/回归：读拟合参数，核对声明值
 ▪ 表格数据：全量扫描，与文中数字交叉验证
 
 ✅ 自检清单：
 (1)所有数字有据可查 (2)无绝对化措辞 (3)所有 Fig/Table 已覆盖
 (4)双引号句子可原文定位 (5)无 TODO/待补充 占位`,
 
-        // Prompt #3 — 期刊审稿人风格
-        `Act as a peer reviewer for a catalysis journal. You are evaluating a manuscript and need to produce a
+        // Prompt #3 — 期刊审稿人（英文指令，中文输出）
+        `Act as a peer reviewer for an academic journal. You are evaluating a manuscript and need to produce a
 structured 7-section reading digest. Write the digest in Chinese.
 
 Guidelines:
@@ -262,10 +261,10 @@ Title / Authors / Affiliations / Journal.Year.Volume.Pages / DOI / Corresponding
 - Why are existing approaches insufficient?
 - What does this work aim to achieve?
 
-### Section III — Experimental & Computational Approach
-- Synthesis details (amounts, temperatures, times, precursors)
-- Characterization panel (XRD, TEM, TPR, XPS, etc.)
-- Performance evaluation conditions (GHSV, T range, feed composition)
+### Section III — Methodology
+- Study objects and materials (key conditions and parameters)
+- Analysis / characterization panel
+- Evaluation conditions and metrics
 
 ### Section IV — Principal Findings
 - List each major result with exact values, figure/table references
@@ -285,22 +284,22 @@ Title / Authors / Affiliations / Journal.Year.Volume.Pages / DOI / Corresponding
 ≤300 words, covering core findings with key numbers
 
 ---
+
 Figure-by-Figure Analysis Protocol:
-▪ XRD: 2θ positions, (hkl) assignments, Scherrer size vs text, impurity peaks
-▪ TEM/HRTEM: Visual size estimate, dispersion, lattice fringe spacing vs labels
-▪ H₂-TPR: Peak temperatures, relative areas, peak assignments, cross-sample comparison
-▪ XPS: Binding energy verification, relative intensity → conclusion consistency check
-▪ Activity curves: Read key data points directly, verify claimed conversion values, detect deactivation
-▪ Arrhenius/TOF: Extract Eₐ, cross-check with stated value, note outliers
-▪ Tables: Full scan, cross-reference every cited number, check footnotes
+▪ Spectra/diffraction/chromatograms: peak positions, assignments, derived quantities vs text
+▪ Microscopy/imaging: visual size estimates, distribution, labeled scale features vs text
+▪ Performance/trend curves: read key data points directly, verify claimed values, detect drift
+▪ Statistical plots: means, error bars, significance marks → consistency with conclusions
+▪ Fits/regressions: extract fitted parameters, cross-check with stated values, note outliers
+▪ Tables: full scan, cross-reference every cited number, check footnotes
 
 Post-completion Audit:
 (1) Every number traceable to source (2) No unqualified superlatives
-(3) All Figures/Tables covered (4) Quoted English text verifiable
+(3) All Figures/Tables covered (4) Quoted text verifiable
 (5) No placeholder text (TODO/TBD)`,
 
-        // Prompt #4 — 工业催化研发主任风格
-        `你是某化工企业催化研发中心的主任工程师，正在评估一篇催化文献的技术价值。
+        // Prompt #4 — 行业研发工程师
+        `你是 某企业研发中心的主任工程师，正在评估一篇学术文献的技术价值。
 请以工程研发视角，撰写一份 7 段技术评估笔记。
 
 ⚠️ 铁律：
@@ -312,14 +311,14 @@ Post-completion Audit:
 标题 · 作者 · 机构 · 期刊/年/卷/页 · DOI · 通讯 · 技术关键词
 
 ▎2. 技术需求分析
-(1) 要解决什么工业问题？
+(1) 要解决什么实际问题？
 (2) 现有技术方案为什么不够？
 (3) 这套方案的技术逻辑是什么？
 
-▎3. 工艺路线
-- 催化剂合成：投料量/温度曲线/时间/气氛/后处理
-- 表征矩阵：XRD · TEM · TPR · XPS · BET · Raman
-- 测试工况：GHSV · 温度窗口 · 原料配比 · 压力
+▎3. 技术路线
+- 对象与材料：关键条件、参数、投入
+- 分析/表征矩阵：逐项列出
+- 测试工况：条件窗口、指标、规模
 
 ▎4. 实测数据分析
 逐条列出结果，格式：
@@ -333,20 +332,20 @@ Post-completion Audit:
 
 ▎6. 工程可行性评估
 - 作者认识到的局限（逐条列出）
-- 工业化前景判断（标注"[工程估计]"）
+- 落地前景判断（标注"[工程估计]"）
 - 需要补充的数据（标注"[文献未给]"）
 
 ▎7. 结论速览
 ≤300 字，包含所有关键性能指标的具体数值
 
 ---
+
 📊 图表定量解读清单：
-● XRD：2θ 峰位 → (hkl) 归属 → Scherrer 计算 → 杂质检查
-● TEM：目测粒径范围(nm) → 均匀性 → HRTEM 晶面间距实测 vs 标注
-● H₂-TPR：各峰 Tmax/面积 → 物种归属 → 样品间差异
-● XPS：结合能核实 → 峰强 → 支撑结论？
-● CO 转化率-T 曲线：逐点取值 → 对比申报值 → 稳定期趋势
-● Arrhenius/TOF：提取 Eₐ → 与文中给定值对比 → 辨别异常点
+● 谱图类：特征峰位置 → 归属 → 衍生参数核算 → 异常检查
+● 显微/影像：目测特征尺寸 → 均匀性 → 标注尺度实测 vs 文本
+● 性能曲线：逐点取值 → 对比申报值 → 稳定期趋势
+● 统计图表：均值/误差/显著性 → 支撑结论？
+● 拟合/回归：提取参数 → 与文中给定值对比 → 辨别异常点
 ● 表格：全表扫描 → 每个数字与正文交叉核对 → 记录注脚条件
 
 📋 完成后自检：(1)数字可溯源 (2)无浮夸用词 (3)图表全覆盖 (4)引号可定位 (5)无占位符`
@@ -1302,7 +1301,7 @@ Post-completion Audit:
                     if (!mdBox || isInsideOurPanel(mdBox)) continue;
                     const text = (mdBox.textContent || '').trim();
                     if (text.length < 50) continue;
-                    if (text.startsWith('你是 WGS') || text.startsWith('你是 ')) continue;
+                    if (text.startsWith('你是 ')) continue;
                     if (text.includes('<标题/作者')) continue;
                     const fp = hashText(text);
                     if (fingerprints.has(fp)) continue;
@@ -1330,7 +1329,7 @@ Post-completion Audit:
             if (newMsg && newMsgText.length > 50) {
                 const currentLength = newMsgText.length;
                 const preview = newMsgText.substring(0, 100);
-                if (preview.includes('你是 WGS') || (preview.includes('你是 ') && preview.includes('研究员'))) {
+                if (preview.includes('你是 ') && (preview.includes('研究员') || preview.includes('工程师'))) {
                     newMsg = null; newMsgText = ''; lastTextLength = 0; stableCount = 0;
                     await sleep(CHECK_INTERVAL); continue;
                 }
@@ -2230,7 +2229,7 @@ Post-completion Audit:
                     <div class="db-section-title">📝 Prompt 模板（5种变体轮换抗风控）</div>
                     <div class="db-prompt-tabs" id="db-prompt-tabs">
                         <span class="db-prompt-tab active" data-tab="0">🧑‍🔬 博士后</span>
-                        <span class="db-prompt-tab" data-tab="1">👨‍🏫 资深科学家</span>
+                        <span class="db-prompt-tab" data-tab="1">👨‍🏫 资深研究员</span>
                         <span class="db-prompt-tab" data-tab="2">🎓 博士生</span>
                         <span class="db-prompt-tab" data-tab="3">📝 审稿人</span>
                         <span class="db-prompt-tab" data-tab="4">🏭 工业研发</span>
