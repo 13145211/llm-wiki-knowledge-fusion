@@ -1,0 +1,1641 @@
+// ==UserScript==
+// @name         千问 PDF 批量上传器 Pro
+// @namespace    https://github.com/qclaw/qianwen-pdf-uploader
+// @version      4.0.0
+// @description  v4.0.0: Prompt轮换|回答验证|日志|时间窗口|重试
+// @author       QClaw
+// @match        https://www.qianwen.com/*
+// @match        https://qianwen.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_addStyle
+// @grant        GM_listValues
+// @grant        GM_setClipboard
+// @grant        GM_download
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+  'use strict';
+
+  // ==================== 常量 ====================
+  var STORE_PREFIX = 'qwpdf_';
+  var PANEL_ID = 'qw-uploader-panel';
+  var DROP_OVERLAY_ID = 'qw-drop-overlay';
+
+  var DEFAULT_CONFIG = {
+    folderDisplayName: '',
+    intervalMinutes: 10,
+    fileParseWaitSeconds: 10,
+    sendDelaySeconds: 2,
+    responseTimeoutMinutes: 25,
+    responseStableSeconds: 10,
+    responseMinWaitSeconds: 20,
+    autoClearAfterComplete: false,
+    autoPrompt: true,
+    promptText: '',
+    autoSave: true,
+    cooldownMinutes: 120,
+    wakeupPrompt: 'hello',
+    uploadWaitSeconds: 5,
+    promptDoneWaitSeconds: 2,
+    presendWaitSeconds: 3,
+    activePromptTab: 0,
+    autoRotateEnabled: true,
+    scheduleStart: '',
+    scheduleEnd: ''
+  };
+
+  var STATE = {
+    running: false, paused: false, queue: [], currentIndex: -1,
+    totalUploaded: 0, dirHandle: null, config: null, ui: {},
+    consecutiveFailures: 0,
+    logBuffer: [], logLoaded: false,
+    lastSavedHash: '', processedHashes: [], baselineFingerprints: new Set(),
+    prompt_index: 0
+  };
+
+  // 网络拦截器状态
+  var NET = {
+    collecting: false,
+    collectedText: '',
+    lastActivity: 0,
+    targetReqId: '',
+    reqStartTime: 0
+  };
+
+  var selectedFiles = {};
+
+  // ==================== GM 存储 ====================
+  function gmGet(key, fallback) {
+    var val = GM_getValue(STORE_PREFIX + key, null);
+    if (val === null || val === undefined) return fallback;
+    try { return JSON.parse(val); } catch(e) { return val; }
+  }
+  function gmSet(key, value) { GM_setValue(STORE_PREFIX + key, JSON.stringify(value)); }
+
+  var DEFAULT_PROMPT =
+'你是 WGS（水煤气变换反应）催化剂领域的博士后研究员。\n'+
+'你的任务是精读一篇催化文献，撰写 7 段结构化笔记。\n\n'+
+'你必须完全忠实地报告**文献原文和图表中的信息**——不能编造任何数字、结论或引用。\n'+
+'当文本和图像信息冲突时，以图像为准并注明矛盾。\n'+
+'如果需要推断，必须标注"合理推断"或"作者未述"。\n\n'+
+'## 1. 基本信息\n<标题/作者/机构/期刊/年份/DOI/通讯/关键词>\n\n'+
+'## 2. 研究背景与问题\n<含(1)具体科学挑战 (2)已有方案不足 (3)本文目标>\n\n'+
+'## 3. 方法/技术路线\n<制备条件(克数/温度/时间/前驱体) + 表征手段(XRD/TEM/TPR/XPS/...) + 性能测试条件>\n\n'+
+'## 4. 核心结果\n<含具体数字 + 图表引用 + 图像解读。每项结果必须注明依据来源>\n\n'+
+'## 5. 创新点\n<基于作者 abstract + conclusions 改写，用"作者报告/作者通过"+ 标"依据"。\n不得使用原文未出现的"首次/新发现/新路径"等绝对化措辞。>\n\n'+
+'## 6. 局限与展望\n<作者自陈 + 合理推断(标"合理推断"或"作者未述")>\n\n'+
+'## 7. 原始文本摘要\n<≤300 字，覆盖核心发现>\n\n'+
+'当遇到以下类型图表时，必须从图像中读取具体值：\n\n'+
+'【XRD 衍射图】读出各衍射峰 2θ 位置和晶面指数，Scherrer 晶粒尺寸与文本对比\n'+
+'【TEM/HRTEM 照片】估算颗粒尺寸范围(nm)，HRTEM 晶格条纹间距\n'+
+'【H₂-TPR 曲线】各还原峰的峰温和相对面积\n'+
+'【XPS 谱图】核实结合能标注\n'+
+'【活性曲线/Arrhenius/TOF】直接读取关键数据点，验证Eₐ值\n'+
+'【Table 数据】验证文中引用数字与表一致\n\n'+
+'完成 7 段后自检：数字反查 | 创新点clean check | 图表引用完整性 | 引号原话 | 零占位符';
+
+  // ==================== 配置 ====================
+
+  // PROMPT_POOL and rotation
+  var PROMPT_POOL = [DEFAULT_PROMPT];
+  var PROMPT_POOL_ORIG = [DEFAULT_PROMPT];
+  function getOriginalPrompt(idx) { return PROMPT_POOL_ORIG[idx] || DEFAULT_PROMPT; }
+  function getRotatedPrompt() {
+    var cfg = getConfig();
+    if (!cfg.autoRotateEnabled) return cfg.promptText || DEFAULT_PROMPT;
+    var idx = STATE.prompt_index !== undefined ? STATE.prompt_index : 0;
+    STATE.prompt_index = (idx + 1) % PROMPT_POOL.length;
+    gmSet("prompt_index", STATE.prompt_index);
+    return PROMPT_POOL[idx % PROMPT_POOL.length];
+  }
+  function updateRotateIndex() {
+    if (!STATE.ui || !STATE.ui.rotateIndex) return;
+    var cfg = getConfig();
+    STATE.ui.rotateIndex.textContent = cfg.autoRotateEnabled !== false ? "next#" + STATE.prompt_index : "fixed";
+  }
+
+  function getConfig() {
+    if (STATE.config) return STATE.config;
+    var saved = gmGet('config', {});
+    STATE.config = Object.assign({}, DEFAULT_CONFIG, saved);
+    if (!STATE.config.promptText) STATE.config.promptText = DEFAULT_PROMPT;
+    return STATE.config;
+  }
+  function saveConfig() { gmSet('config', STATE.config); }
+  function getUploadedSet() { return new Set(gmGet('uploaded', [])); }
+  function addUploaded(filename, status) {
+    var records = gmGet('uploadRecords', []);
+    var ei = records.findIndex(function(r){return r.name===filename;});
+    var rec = {name:filename, status:status||'success', timestamp:new Date().toISOString(), attempts: ei>=0?(records[ei].attempts||0)+1:1};
+    if(ei>=0) records[ei]=rec; else records.push(rec);
+    gmSet('uploadRecords', records);
+    var s=getUploadedSet(); s.add(filename); gmSet('uploaded', Array.from(s)); STATE.totalUploaded=s.size;
+  }
+  function clearUploaded() { gmSet('uploaded',[]); gmSet('uploadRecords',[]); STATE.totalUploaded=0; }
+  function removeUploaded(filename) {
+    var s=getUploadedSet(); s.delete(filename); gmSet('uploaded',Array.from(s));
+    gmSet('uploadRecords',gmGet('uploadRecords',[]).filter(function(r){return r.name!==filename;}));
+    STATE.totalUploaded=s.size;
+  }
+  function getUploadRecords(){return gmGet('uploadRecords',[]);}
+  function updateRetryFailedButton(){
+    if(!STATE.ui.btnRetryFailed)return;
+    var cnt=gmGet('uploadRecords',[]).filter(function(r){return r.status==='invalid'||r.status==='no_response';}).length;
+    STATE.ui.btnRetryFailed.disabled=cnt===0;
+    STATE.ui.btnRetryFailed.textContent='retry('+cnt+')';
+  }
+  // Persistence
+  function persistLog(msg,lvl){
+    STATE.logBuffer.push({time:new Date().toISOString(),level:lvl||'info',msg:msg});
+    if(STATE.logBuffer.length>500)STATE.logBuffer.shift();
+    gmSet('logBuffer',STATE.logBuffer);
+  }
+  function loadPersistedLog(){if(!STATE.logLoaded){STATE.logBuffer=gmGet('logBuffer',[]);STATE.logLoaded=true;}}
+  function exportLogToFile(){
+    var recs=getUploadRecords(),lines=[];
+    lines.push('===== qianwen upload report =====','Time: '+new Date().toLocaleString(),'Queue: '+STATE.queue.length,'Done: '+getUploadedSet().size,'');
+    for(var i=0;i<STATE.queue.length;i++){
+      var item=STATE.queue[i],done=getUploadedSet().has(item.name),rec=recs.find(function(r){return r.name===item.name;});
+      var st=done?(rec&&rec.status==='invalid'?'INVALID':(rec&&rec.status==='no_response'?'NOREPLY':'OK')):'PENDING';
+      lines.push(st+' '+item.name+(rec?' ('+new Date(rec.timestamp).toLocaleString()+')':''));
+    }
+    lines.push('','-- LOGS --');
+    var rl=STATE.logBuffer.slice(-200);
+    for(var j=0;j<rl.length;j++){var e=rl[j];lines.push('['+e.time.slice(0,19)+'] '+e.level.toUpperCase()+' '+e.msg);}
+    var blob=new Blob([lines.join('\n')],{type:'text/plain;charset=utf-8'});
+    var url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download='qw-log-'+new Date().toISOString().slice(0,10)+'.txt';a.style.display='none';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(function(){URL.revokeObjectURL(url);},1000);
+  }
+  function parseLogAndRestore(txt){
+    var lines=txt.split('\n'),records=[];
+    for(var i=0;i<lines.length;i++){
+      var m=lines[i].match(/^(OK|INVALID|NOREPLY)\s+(.+)$/);
+      if(m){var st=m[1]==='OK'?'success':(m[1]==='INVALID'?'invalid':'no_response');records.push({name:m[2].trim(),status:st,timestamp:new Date().toISOString(),attempts:1});}
+    }
+    var existing=gmGet('uploadRecords',[]);
+    for(var j=0;j<records.length;j++){var ri=existing.findIndex(function(r){return r.name===records[j].name;});if(ri>=0)existing[ri]=records[j];else existing.push(records[j]);}
+    gmSet('uploadRecords',existing);
+    var us=gmGet('uploaded',[]);for(var k=0;k<records.length;k++){if(us.indexOf(records[k].name)<0)us.push(records[k].name);}
+    gmSet('uploaded',us);STATE.totalUploaded=us.length;
+    return records.length;
+  }
+  function parseRange(str,maxLen){
+    var result=[],parts=str.split(',');
+    for(var i=0;i<parts.length;i++){
+      var t=parts[i].trim(),rm=t.match(/^(\d+)\s*-\s*(\d+)$/);
+      if(rm){for(var n=Math.max(1,parseInt(rm[1]));n<=Math.min(maxLen,parseInt(rm[2]));n++)result.push(n-1);}
+      else{var num=parseInt(t);if(!isNaN(num)&&num>=1&&num<=maxLen)result.push(num-1);}
+    }
+    var seen={};return result.filter(function(x){if(seen[x])return false;seen[x]=true;return true;});
+  }
+
+  // ==================== 工具函数 ====================
+  function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+  function inside(el) { return !!(el && el.closest && (el.closest('#'+PANEL_ID) || el.closest('#'+DROP_OVERLAY_ID))); }
+  function visible(el) {
+    if (!el || el.offsetParent === null) return false;
+    var s = window.getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  }
+
+  function nativeClick(el) {
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    var cx = r.left + r.width/2, cy = r.top + r.height/2;
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t) {
+      el.dispatchEvent(new MouseEvent(t, { bubbles:true, cancelable:true, clientX:cx, clientY:cy }));
+    });
+    return true;
+  }
+
+  // ==================== ★ 网络拦截层（参考 WebAI2API 的 page.on('response') 思路） ====================
+
+  /**
+   * v3.0.0 核心：劫持 fetch 来拦截千问的 API 回答
+   *
+   * 千问聊天 API 特征：
+   * - POST 请求，URL 通常包含 chat/completion 或 /api/ 等路径
+   * - 响应是 SSE (text/event-stream) 或 JSON 流
+   * - 我们在 fetch 返回后读取响应文本，提取 AI 回答
+   *
+   * 对于 SSE 流：
+   * - 千问使用 ReadableStream，我们能拿到完整的 response body
+   * - 监听 response.clone().text() 来获取完整内容
+   *
+   * 工作流程：
+   * 1. 发送消息前，startCollecting() 激活拦截
+   * 2. 所有 fetch 响应被检查，匹配聊天 API 的响应被收集
+   * 3. 回答完成后，stopCollecting() 返回收集到的文本
+   */
+
+  var _origFetch = window.fetch;
+
+  window.fetch = function(url, opts) {
+    var urlStr = (typeof url === 'string') ? url : (url.url || '');
+    var fetchPromise = _origFetch.call(this, url, opts);
+
+    // ★ 收集期间：记录所有 POST 请求用于调试
+    if (NET.collecting && opts && opts.method === 'POST') {
+      // 调试: 打印所有 POST URL（不管是否匹配）
+      log('🔍 [调试] POST: ' + urlStr.substring(0, 120), 'info');
+
+      var matchesChat = false;
+
+      // 先排除明显非聊天的请求
+      var skipPatterns = ['track.uc.cn', 'analytics', 'telemetry', 'beacon',
+        'collect', 'log', 'metric', 'aplus', 'cnzz', 'pageview',
+        '.png', '.jpg', '.gif', '.svg', '.woff', 'abtest',
+        'fingerprint', 'rum', 'perf', 'trace',
+      ];
+      for (var si = 0; si < skipPatterns.length; si++) {
+        if (urlStr.indexOf(skipPatterns[si]) !== -1) break;
+      }
+      if (si >= skipPatterns.length) {
+        // 没匹配到排除项，尝试匹配聊天
+        var chatKw = ['chat', 'completion', 'qwen', 'assistant', 'send',
+          'generate', 'conversation', 'message', '/api/', '/v1/', '/v2/',
+          'tongyi', 'dashscope', 'aliyun',
+        ];
+        for (var ck = 0; ck < chatKw.length; ck++) {
+          if (urlStr.indexOf(chatKw[ck]) !== -1) { matchesChat = true; break; }
+        }
+        // URL 不匹配但 body 很大也是聊天请求
+        if (!matchesChat && opts.body && typeof opts.body === 'string' && opts.body.length > 200) {
+          matchesChat = true;
+        }
+      }
+
+      if (matchesChat) {
+        var reqId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+        NET.targetReqId = reqId;
+        NET.reqStartTime = Date.now();
+        NET.lastActivity = Date.now();
+        log('🌐 ★ 拦截聊天API: ' + urlStr.substring(0, 80), 'success');
+
+        fetchPromise.then(function(resp) {
+          if (!NET.collecting || NET.targetReqId !== reqId) return;
+          var ct = resp.headers.get('content-type') || '';
+          log('🔍 [调试] Content-Type: ' + ct.substring(0, 60), 'info');
+          var cloned = resp.clone();
+
+          if (ct.indexOf('text/event-stream') !== -1) {
+            log('🌐 SSE流, 解析中...', 'info');
+            cloned.text().then(function(body) {
+              if (!NET.collecting || NET.targetReqId !== reqId) return;
+              var parsed = parseSSE(body);
+              if (parsed.length > NET.collectedText.length) {
+                NET.collectedText = parsed;
+                NET.lastActivity = Date.now();
+                log('🌐 SSE解析成功: ' + parsed.length + '字符', 'success');
+              } else {
+                log('⚠️ SSE解析为空('+(parsed.length)+'字符)', 'warn');
+              }
+            }).catch(function(e) { log('⚠️ SSE读取出错: '+e.message, 'warn'); });
+          } else if (ct.indexOf('application/json') !== -1) {
+            log('🌐 JSON响应, 解析中...', 'info');
+            cloned.text().then(function(body) {
+              if (!NET.collecting || NET.targetReqId !== reqId) return;
+              var text = extractTextFromJSON(body);
+              if (text.length > NET.collectedText.length) {
+                NET.collectedText = text;
+                NET.lastActivity = Date.now();
+                log('🌐 JSON解析成功: ' + text.length + '字符', 'success');
+              } else {
+                log('⚠️ JSON解析为空('+(text.length)+'字符)', 'warn');
+              }
+            }).catch(function(e) { log('⚠️ JSON读取出错: '+e.message, 'warn'); });
+          } else {
+            log('🌐 其他类型('+ct.substring(0,40)+')...', 'info');
+            cloned.text().then(function(body) {
+              if (!NET.collecting || NET.targetReqId !== reqId) return;
+              var text = extractTextFromBody(body);
+              if (text.length > 50 && text.length > NET.collectedText.length) {
+                NET.collectedText = text;
+                NET.lastActivity = Date.now();
+                log('🌐 文本提取成功: ' + text.length + '字符', 'success');
+              }
+            }).catch(function(e) { log('⚠️ 读取出错: '+e.message, 'warn'); });
+          }
+        }).catch(function(e) { log('⚠️ fetch错误: '+e.message, 'warn'); });
+      }
+    }
+
+    return fetchPromise;
+  };
+
+  /**
+   * 解析 SSE (Server-Sent Events) 响应
+   * 参考 WebAI2API doubao_text.js 的 parseSSEResponse
+   */
+  function parseSSE(body) {
+    if (!body) return '';
+    var lines = body.split('\n');
+    var text = '';
+    var reasoning = '';
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+
+      // SSE 格式: data: {...}
+      if (line.indexOf('data:') === 0) {
+        var dataStr = line.substring(5).trim();
+        if (!dataStr || dataStr === '[DONE]') continue;
+
+        try {
+          var data = JSON.parse(dataStr);
+
+          // 提取文本内容（兼容多种SSE格式）
+          // 千问格式1: choices[0].delta.content
+          if (data.choices && data.choices[0]) {
+            var choice = data.choices[0];
+            if (choice.delta && choice.delta.content) text += choice.delta.content;
+            else if (choice.message && choice.message.content) text += choice.message.content;
+            else if (choice.text) text += choice.text;
+
+            // reasoning_content (deepseek 兼容)
+            if (choice.delta && choice.delta.reasoning_content) reasoning += choice.delta.reasoning_content;
+          }
+
+          // 千问格式2: output.text
+          if (data.output && data.output.text) text += data.output.text;
+
+          // 千问格式3: text 字段
+          if (data.text && typeof data.text === 'string') text += data.text;
+
+          // 千问格式4: content 字段
+          if (data.content && typeof data.content === 'string') text += data.content;
+
+          // 千问格式5: msg / message
+          if (data.msg && typeof data.msg === 'string') text += data.msg;
+          if (data.message && typeof data.message === 'string') text += data.message;
+
+          // 豆包格式: CHUNK_DELTA 等
+          if (data.CHUNK_DELTA || data.text_block) {
+            if (data.text) text += data.text;
+          }
+
+        } catch(e) { /* 非 JSON 行，跳过 */ }
+      }
+
+      // 有些 SSE 格式不带 data: 前缀
+      if (line && line.charAt(0) === '{') {
+        try {
+          var d = JSON.parse(line);
+          if (d.choices && d.choices[0]) {
+            var c = d.choices[0];
+            if (c.delta && c.delta.content) text += c.delta.content;
+            else if (c.message && c.message.content) text += c.message.content;
+            else if (c.text) text += c.text;
+          }
+          if (d.text && typeof d.text === 'string') text += d.text;
+          if (d.content && typeof d.content === 'string') text += d.content;
+        } catch(e) {}
+      }
+    }
+
+    // text 优先级 > reasoning
+    return text.length > 0 ? text : reasoning;
+  }
+
+  function extractTextFromJSON(body) {
+    if (!body) return '';
+    try {
+      var data = JSON.parse(body);
+      // 尝试各种已知格式
+      if (data.choices && data.choices[0]) {
+        var c = data.choices[0];
+        if (c.message && c.message.content) return c.message.content;
+        if (c.text) return c.text;
+      }
+      if (data.output && data.output.text) return data.output.text;
+      if (data.text) return data.text;
+      if (data.content) return data.content;
+      if (data.data && data.data.text) return data.data.text;
+      // 返回最长的字符串字段
+      return findLongestString(data);
+    } catch(e) { return ''; }
+  }
+
+  function extractTextFromBody(body) {
+    if (!body || body.length < 50) return '';
+    // 尝试 JSON 解析
+    if (body.charAt(0) === '{') {
+      var t = extractTextFromJSON(body);
+      if (t.length > 50) return t;
+    }
+    // 直接返回（可能是纯文本响应）
+    return body.trim();
+  }
+
+  function findLongestString(obj, depth) {
+    if (depth === undefined) depth = 0;
+    if (depth > 10 || !obj) return '';
+    if (typeof obj === 'string') return obj;
+    var best = '';
+    if (Array.isArray(obj)) {
+      for (var i = 0; i < obj.length; i++) {
+        var s = findLongestString(obj[i], depth + 1);
+        if (s.length > best.length) best = s;
+      }
+    } else if (typeof obj === 'object') {
+      var keys = Object.keys(obj);
+      for (var j = 0; j < keys.length; j++) {
+        var s2 = findLongestString(obj[keys[j]], depth + 1);
+        if (s2.length > best.length) best = s2;
+      }
+    }
+    return best;
+  }
+
+  function startCollecting() {
+    NET.collecting = true;
+    NET.collectedText = '';
+    NET.targetReqId = '';
+    NET.reqStartTime = Date.now();
+    NET.lastActivity = Date.now();
+  }
+
+  function stopCollecting() {
+    NET.collecting = false;
+    var text = NET.collectedText;
+    NET.collectedText = '';
+    NET.targetReqId = '';
+    return text;
+  }
+
+  // ==================== 千问 DOM 查找 ====================
+
+  function findInputBox() {
+    var el = document.querySelector('[role="textbox"]');
+    if (el && !inside(el)) return el;
+    var eds = document.querySelectorAll('[contenteditable="true"]');
+    for (var i = 0; i < eds.length; i++) {
+      if (!inside(eds[i]) && visible(eds[i])) return eds[i];
+    }
+    var tas = document.querySelectorAll('textarea');
+    for (var j = 0; j < tas.length; j++) {
+      if (!inside(tas[j]) && visible(tas[j])) return tas[j];
+    }
+    return null;
+  }
+
+  function findAttachButton() {
+    var btn = document.querySelector('button[aria-label="添加附件"]');
+    if (btn && !inside(btn) && visible(btn)) return btn;
+    var btns = document.querySelectorAll('button, [role="button"]');
+    for (var i = 0; i < btns.length; i++) {
+      if (inside(btns[i]) || !visible(btns[i])) continue;
+      var t = (btns[i].textContent||'') + (btns[i].getAttribute('aria-label')||'');
+      if (t.indexOf('添加附件')>=0 || t.indexOf('上传文件')>=0 || t.indexOf('文件上传')>=0) return btns[i];
+    }
+    return null;
+  }
+
+  function findSendButton() {
+    var uses = document.querySelectorAll('use');
+    for (var i = 0; i < uses.length; i++) {
+      var href = uses[i].getAttribute('href') ||
+                 uses[i].getAttribute('xlink:href') ||
+                 uses[i].getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '';
+      if (href.indexOf('sendChat')>=0 || href.indexOf('send')>=0) {
+        var btn = uses[i].closest('button');
+        if (btn && btn.offsetParent && !inside(btn)) return btn;
+      }
+    }
+    // aria-label
+    var found = null;
+    ['发送消息','发送','send'].forEach(function(l) {
+      if (found) return;
+      var b = document.querySelector('[aria-label="'+l+'"]');
+      if (b && !inside(b) && visible(b)) found = b;
+    });
+    if (found) return found;
+    // 输入框旁边最后一个按钮
+    var ib = findInputBox();
+    if (ib) {
+      var c = ib.closest('form, [class*="input"], [class*="composer"], [class*="bottom"]');
+      if (c) {
+        var all = c.querySelectorAll('button');
+        for (var j = all.length-1; j >= 0; j--) {
+          if (visible(all[j]) && !isDanger(all[j])) return all[j];
+        }
+      }
+    }
+    return null;
+  }
+
+  function isDanger(el) {
+    var t = ((el.textContent||'')+' '+(el.getAttribute('aria-label')||'')).toLowerCase();
+    return ['朗读','语音','voice','播放','play','截图','screenshot','分享','share',
+            '设置','settings','stop','停止','暂停','pause','取消','cancel'].some(function(w){return t.indexOf(w)>=0;});
+  }
+
+  function findFileInput() {
+    var inputs = document.querySelectorAll('input[type="file"]');
+    for (var i = 0; i < inputs.length; i++) {
+      if (!inside(inputs[i])) return inputs[i];
+    }
+    return null;
+  }
+
+  function setFileToInput(input, file) {
+    var dt = new DataTransfer();
+    dt.items.add(file);
+    try { input.files = dt.files; }
+    catch(e) {
+      try { Object.defineProperty(input, 'files', { value: dt.files, writable: false }); }
+      catch(e2) { log('❌ 设置 files 失败: '+e2.message, 'error'); return false; }
+    }
+    input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    log('✅ 文件已设置, files.length='+input.files.length, 'info');
+    return input.files.length > 0;
+  }
+
+  // ★ v3.0.2: 单次注入 + 防重复标志
+  var _pwPendingFile = null;        // 待注入的文件
+  var _pwInjected = false;          // 防止重复注入
+  var _pwInjectionDone = null;      // resolve Promise when injection completes
+
+  // 仅劫持 window.showOpenFilePicker（千问实际使用的 API）
+  // 不再劫持 showPicker/click，避免多次触发导致重复文件
+  var _origSOFP = null;
+
+  function patchFileInputHooks(fileObj) {
+    _pwPendingFile = fileObj;
+    _pwInjected = false;
+    _pwInjectionDone = null;
+
+    if (!_origSOFP && window.showOpenFilePicker) {
+      _origSOFP = window.showOpenFilePicker;
+    }
+    if (window.showOpenFilePicker) {
+      window.showOpenFilePicker = function(opts) {
+        if (_pwPendingFile && !_pwInjected) {
+          _pwInjected = true;
+          var f = _pwPendingFile;
+          log('🎯 拦截 showOpenFilePicker, 阻止原生对话框', 'info');
+
+          // 不调用 _origSOFP → 不弹出原生对话框 → 不触发 user activation 错误
+
+          // 延迟注入文件到 DOM file input（等千问内部状态准备好）
+          return new Promise(function(resolve) {
+            setTimeout(function() {
+              var inp = findFileInput();
+              if (inp) {
+                setFileToInput(inp, f);
+                _pwPendingFile = null;
+              }
+              // 返回一个没法用的 mock 句柄，但千问会从 input change 事件拿到文件
+              resolve([{ name: f.name, kind: 'file', getFile: function() { return Promise.resolve(f); } }]);
+            }, 200);
+          });
+        }
+        if (_origSOFP) return _origSOFP.call(window, opts);
+        return Promise.reject(new Error('AbortError'));
+      };
+    }
+  }
+
+  function unpatchFileInputHooks() {
+    _pwPendingFile = null;
+    _pwInjected = false;
+  }
+
+  // ==================== 输入 Prompt ====================
+  async function typePromptIntoChat(text) {
+    var ed = findInputBox();
+    if (!ed) { log('⚠️ 未找到输入框', 'warn'); return false; }
+    ed.focus(); await sleep(300);
+    try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(text); } catch(e) {}
+
+    // 方式1: paste
+    try {
+      var sel = window.getSelection(); sel.removeAllRanges();
+      var rg = document.createRange(); rg.selectNodeContents(ed); sel.addRange(rg);
+      document.execCommand('delete', false); await sleep(100);
+      var pe = new ClipboardEvent('paste', { bubbles:true, composed:true, cancelable:true });
+      var dt = new DataTransfer(); dt.setData('text/plain', text);
+      Object.defineProperty(pe, 'clipboardData', { get: function(){return dt;} });
+      ed.dispatchEvent(pe); await sleep(300);
+      var tc = (ed.textContent||ed.value||'').trim();
+      if (tc.length > 20) { log('✅ Prompt已输入 (paste, '+tc.length+'字符)', 'info'); return true; }
+    } catch(e) {}
+
+    // 方式2: 赋值
+    try {
+      ed.focus();
+      if (ed.contentEditable==='true') ed.textContent = text; else ed.value = text;
+      ed.dispatchEvent(new InputEvent('input', { bubbles:true, composed:true, inputType:'insertText' }));
+      await sleep(200);
+      var tc2 = (ed.textContent||ed.value||'').trim();
+      if (tc2.length > 20) { log('✅ Prompt已输入 (赋值, '+tc2.length+'字符)', 'info'); return true; }
+    } catch(e) {}
+
+    // 方式3: execCommand
+    try {
+      ed.focus(); document.execCommand('selectAll', false); document.execCommand('delete', false);
+      var lines = text.split('\n');
+      for (var i=0; i<lines.length; i++) {
+        if (i>0) document.execCommand('insertLineBreak', false);
+        if (lines[i].length>0) document.execCommand('insertText', false, lines[i]);
+      }
+      ed.dispatchEvent(new InputEvent('input', { bubbles:true, composed:true, inputType:'insertText' }));
+      await sleep(300);
+      var tc3 = (ed.textContent||ed.value||'').trim();
+      if (tc3.length >= 20) { log('✅ Prompt已输入 (execCommand, '+tc3.length+'字符)', 'info'); return true; }
+    } catch(e) {}
+
+    log('❌ 所有输入方式失败', 'error'); return false;
+  }
+
+  // ==================== 发送 ====================
+  function clickSendButton() {
+    var ed = findInputBox();
+    if (ed) {
+      ed.focus();
+      ed.dispatchEvent(new KeyboardEvent('keydown', {
+        key:'Enter', code:'Enter', keyCode:13, which:13,
+        bubbles:true, composed:true, cancelable:true
+      }));
+      log('📨 发送(Enter)', 'info'); return true;
+    }
+    var btn = findSendButton();
+    if (btn) { nativeClick(btn); log('📨 发送(按钮)', 'info'); return true; }
+    log('⚠️ 未能发送', 'warn'); return false;
+  }
+
+  // ==================== ★ 回答等待（网络优先 + DOM兜底） ====================
+
+  /**
+   * v3.0.0: 双通道回答获取
+   * 通道1 (主): 网络拦截 fetch → 直接读 API 流式响应 → 最准确
+   * 通道2 (备): DOM 扫描 → 找 markdown 块 → 兜底
+   */
+
+  // DOM 快照
+  function countMessageBubbles() {
+    var rounds = document.querySelectorAll(
+      '[class*="chat-round"], [class*="ChatRound"], ' +
+      '[class*="message-item"], [class*="MessageItem"], ' +
+      '[class*="conversation-turn"], [class*="ConversationTurn"]'
+    );
+    var mdBlocks = document.querySelectorAll(
+      '.qk-markdown, .qk-markdown-react, [class*="markdown-content"]'
+    );
+    return {
+      rounds: rounds.length,
+      markdowns: mdBlocks.length,
+      lastRound: rounds.length > 0 ? rounds[rounds.length-1] : null
+    };
+  }
+
+  // DOM 通道：获取新增回答
+  function getNewAnswerText(snapshot) {
+    var rounds = document.querySelectorAll(
+      '[class*="chat-round"], [class*="ChatRound"], ' +
+      '[class*="message-item"], [class*="MessageItem"], ' +
+      '[class*="conversation-turn"], [class*="ConversationTurn"]'
+    );
+
+    var newRounds = [];
+    if (rounds.length > snapshot.rounds && snapshot.lastRound) {
+      var startIdx = -1;
+      for (var i = 0; i < rounds.length; i++) {
+        if (rounds[i] === snapshot.lastRound) { startIdx = i+1; break; }
+      }
+      if (startIdx < 0) startIdx = snapshot.rounds;
+      for (var j = startIdx; j < rounds.length; j++) {
+        if (!inside(rounds[j])) newRounds.push(rounds[j]);
+      }
+    }
+
+    var best = '';
+    for (var k = 0; k < newRounds.length; k++) {
+      var md = newRounds[k].querySelector('.qk-markdown, .qk-markdown-react, [class*="markdown"]');
+      if (md && !inside(md)) { var t = (md.textContent||'').trim(); if (t.length > best.length && !isPrompt(t)) best = t; }
+      if (best.length < 50) { var t2 = (newRounds[k].textContent||'').trim(); if (t2.length > best.length && !isPrompt(t2)) best = t2; }
+    }
+
+    var mdBlocks = document.querySelectorAll('.qk-markdown, .qk-markdown-react, [class*="markdown-content"]');
+    if (best.length < 100 && mdBlocks.length > snapshot.markdowns) {
+      for (var m = snapshot.markdowns; m < mdBlocks.length; m++) {
+        if (inside(mdBlocks[m])) continue;
+        var t3 = (mdBlocks[m].textContent||'').trim();
+        if (t3.length > best.length && !isPrompt(t3)) best = t3;
+      }
+    }
+
+    if (best.length < 200) {
+      var mains = document.querySelectorAll('main');
+      for (var n = mains.length-1; n >= 0; n--) {
+        if (inside(mains[n])) continue;
+        var divs = mains[n].querySelectorAll('div');
+        for (var p = divs.length-1; p >= 0; p--) {
+          if (inside(divs[p])) continue;
+          var t4 = (divs[p].textContent||'').trim();
+          if (t4.length < 300) continue;
+          if (isPrompt(t4)) continue;
+          if (t4.indexOf('新建对话')>=0 && t4.indexOf('智能体')>=0) continue;
+          if (t4.indexOf('API 服务')>=0 && t4.length<500) continue;
+          if (t4.length > best.length) best = t4;
+        }
+      }
+    }
+    return best;
+  }
+
+  function isPrompt(text) {
+    if (!text) return false;
+    if (text.indexOf('你是 WGS')===0) return true;
+    if (text.indexOf('你是 ')===0 && text.indexOf('研究员')>5) return true;
+    if (text.indexOf('<标题/作者')>=0 || text.indexOf('< 标题')>=0) return true;
+    return false;
+  }
+
+  // Validation
+  function isValidResponse(text, promptText) {
+    if (!text || text.length < 300) return { valid: false, reason: "short(" + (text?text.length:0) + ")" };
+    return { valid: true, reason: "ok:" + text.length };
+  }
+
+  // Time window
+  function isWithinSchedule(cfg){
+    if(!cfg.scheduleStart||!cfg.scheduleEnd)return true;
+    var n=new Date(),nm=n.getHours()*60+n.getMinutes();
+    var sh=parseInt(cfg.scheduleStart.split(":")[0]),sm=parseInt(cfg.scheduleStart.split(":")[1]);
+    var eh=parseInt(cfg.scheduleEnd.split(":")[0]),em=parseInt(cfg.scheduleEnd.split(":")[1]);
+    var smi=sh*60+sm,emi=eh*60+em;
+    if(smi<=emi)return nm>=smi&&nm<=emi;else return nm>=smi||nm<=emi;
+  }
+  function getNextScheduleStart(cfg){
+    if(!cfg.scheduleStart)return null;
+    var sh=parseInt(cfg.scheduleStart.split(":")[0]),sm=parseInt(cfg.scheduleStart.split(":")[1]);
+    var t=new Date();t.setHours(sh,sm,0,0);if(t<=new Date())t.setDate(t.getDate()+1);return t;
+  }
+  function formatTimeRemaining(ms){
+    if(ms<=0)return "now";var h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);
+    if(h>0)return h+"h"+m+"m";return m+"m";
+  }
+  function updateScheduleStatus(cfg){
+    if(!STATE.ui||!STATE.ui.scheduleStatus)return;
+    var c=cfg||getConfig();
+    if(!c.scheduleStart||!c.scheduleEnd){STATE.ui.scheduleStatus.textContent="(off)";STATE.ui.scheduleStatus.style.color="#aaa";return;}
+    if(isWithinSchedule(c)){STATE.ui.scheduleStatus.textContent="OK";STATE.ui.scheduleStatus.style.color="#4ade80";}
+    else{var n=getNextScheduleStart(c);STATE.ui.scheduleStatus.textContent="wait "+formatTimeRemaining(n?n-new Date():0);STATE.ui.scheduleStatus.style.color="#f59e0b";}
+  }
+
+  // New chat
+  async function startNewChat(){
+    log("new chat...","info");await sleep(3000);
+    var bs=document.querySelectorAll("button, a, [role=\"button\"]");
+    var kw=["new","new chat","+"];
+    for(var i=0;i<bs.length;i++){
+      if(inside(bs[i]))continue;var t=(bs[i].textContent||"").trim().toLowerCase();
+      for(var k=0;k<kw.length;k++){if(t.indexOf(kw[k])>=0){bs[i].click();await sleep(3000);return true;}}
+    }
+    try{window.location.href="/chat";await sleep(8000);return true;}catch(e){return false;}
+  }
+
+  // Cooldown
+  async function cooldownAndWake(cfg){
+    var cooldownMs=(cfg.cooldownMinutes||120)*60000;
+    log("cooldown "+Math.round(cooldownMs/60000)+"min...","warn");
+    persistLog("cooldown "+Math.round(cooldownMs/60000)+"min","warn");
+    var start=Date.now();
+    while(Date.now()-start<cooldownMs){if(!STATE.running)return;await sleep(1000);}
+    if(!STATE.running)return;
+    log("wakeup...","info");
+    await startNewChat();await sleep(2000);
+    var wp=cfg.wakeupPrompt||"hello";
+    var ok=await typePromptIntoChat(wp);
+    if(ok){await sleep(1500);startCollecting();clickSendButton();await sleep(180000);stopCollecting();log("wakeup done","success");}
+    await sleep(2000);await startNewChat();
+  }
+
+  // Dedup helpers
+  function hashText(text){var n=text.length;if(n<100)return text.substring(0,50)+"|"+n;return text.substring(0,80)+"|"+text.substring(Math.floor(n*.25),Math.floor(n*.25)+60)+"|"+text.substring(Math.floor(n*.5),Math.floor(n*.5)+60)+"|"+text.substring(Math.floor(n*.75),Math.floor(n*.75)+60)+"|"+text.substring(n-80)+"|"+n;}
+  function isPreviouslySaved(text){var h=hashText(text);if(STATE.processedHashes.indexOf(h)>=0)return true;if(STATE.baselineFingerprints.has(h))return true;return false;}
+  function markBaseline(){var fps=new Set(STATE.processedHashes);var ms=document.querySelectorAll(".qk-markdown,.qk-markdown-react,[class*=\"markdown\"]");for(var i=0;i<ms.length;i++){if(inside(ms[i]))continue;var t=(ms[i].textContent||"").trim();if(t.length>50)fps.add(hashText(t));}STATE.baselineFingerprints=fps;return fps;}
+
+
+  async function waitForResponseComplete(snapshot) {
+    var cfg = getConfig();
+    var timeoutMs = cfg.responseTimeoutMinutes * 60 * 1000;
+    var stableMs = cfg.responseStableSeconds * 1000;
+    var minWaitMs = cfg.responseMinWaitSeconds * 1000;
+    var interval = 2000;
+
+    var start = Date.now();
+    var lastNetText = '';
+    var lastDomText = '';
+    var lastChangeTime = 0;
+
+    log('⏳ 等待回答(网络拦截+DOM双通道, 超时='+cfg.responseTimeoutMinutes+'分)', 'info');
+
+    while (Date.now() - start < timeoutMs) {
+      while (STATE.paused && STATE.running) { await sleep(1000); }
+      if (!STATE.running) return null;
+
+      // ★ 通道1: 网络拦截数据
+      var netText = NET.collectedText || '';
+      var netActivity = NET.lastActivity;
+
+      // ★ 通道2: DOM 扫描
+      var domText = getNewAnswerText(snapshot);
+
+      // 取两个通道中最好的结果
+      var currentText = (netText.length > domText.length) ? netText : domText;
+
+      if (currentText && currentText.length > 100) {
+        if (currentText !== lastNetText) {
+          lastNetText = currentText;
+          lastChangeTime = Date.now();
+        }
+
+        var stableDuration = Date.now() - lastChangeTime;
+        var elapsed = Date.now() - start;
+
+        // 网络层有新数据 → 记录活动时间
+        if (netText && netText !== lastNetText) {
+          lastDomText = netText;
+        }
+
+        if (stableDuration >= stableMs && elapsed >= minWaitMs) {
+          var source = netText.length >= domText.length ? '网络拦截' : 'DOM扫描';
+          log('✅ 回答完成('+currentText.length+'字符, '+source+')', 'success');
+          stopCollecting();
+          return currentText;
+        }
+
+        if (currentText.length > (lastDomText||'').length) {
+          var growth = currentText.length - (lastDomText||'').length;
+          if (growth > 20) log('📝 生成中('+currentText.length+'字符, +'+growth+')', 'info');
+          lastDomText = currentText;
+        }
+      }
+
+      await sleep(interval);
+    }
+
+    // 超时：返回已有的最佳内容
+    var final = stopCollecting();
+    if (final.length > 100) {
+      log('⚠️ 超时，返回网络拦截内容('+final.length+'字符)', 'warn');
+      return final;
+    }
+    if (lastDomText.length > 100) {
+      log('⚠️ 超时，返回DOM扫描内容('+lastDomText.length+'字符)', 'warn');
+      return lastDomText;
+    }
+    log('❌ 等待超时，无有效回答', 'error');
+    return null;
+  }
+
+  // ==================== 提取标题 & 保存 ====================
+  function extractTitle(text, fileName) {
+    var m = text.match(/标题[：:]\s*(.+?)(?:\n|$)/);
+    if (m) { var t=m[1].trim().replace(/\s+/g,' ').substring(0,80).replace(/[\\/:*?"<>|]/g,'_').trim(); if(t.length>2)return t; }
+    var lines = text.split('\n'), inBI = false;
+    for (var i=0; i<lines.length; i++) {
+      if (/##\s*1\.\s*基本信息/i.test(lines[i]) || /^1\.\s*基本信息/.test(lines[i])) { inBI=true; continue; }
+      if (inBI) {
+        var line=lines[i].trim();
+        if (!line || line[0]==='<' || line.indexOf('##')===0) continue;
+        var m2=line.match(/标题[：:]\s*(.+)/);
+        if (m2) { var t2=m2[1].trim().substring(0,80).replace(/[\\/:*?"<>|]/g,'_').trim(); if(t2.length>2)return t2; }
+        var t3=line.substring(0,80).replace(/[\\/:*?"<>|]/g,'_').trim(); if(t3.length>2)return t3;
+      }
+    }
+    var name=fileName.replace(/\.pdf$/i,''); name=name.replace(/^\d+\.\d+\/[^,]+,/,'').trim();
+    return name.substring(0,80) || fileName.substring(0,60);
+  }
+
+  // ★ v3.0.3: save with multi-tier fallback (clipboard first, then a.click, then GM_download)
+  // v4.0.0: save with PDF prefix, multi-tier fallback
+  async function saveResponse(text, title, cfg, originalPdfName) {
+    if (!cfg.autoSave) return false;
+    var prefix = originalPdfName ? originalPdfName.replace(/\.pdf$/i,'').replace(/[\\/:*?"<>|]/g,'_').substring(0,50) : '';
+    var titleClean = title.replace(/[\\/:*?"<>|]/g,'_').substring(0,50);
+    var fn = (prefix ? prefix + '_' : '') + titleClean + '.md';
+
+    // Tier 0: clipboard backup
+    try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(text); log('📋 已复制到剪贴板 (保底)', 'info'); } } catch(e) {}
+
+    // Tier 1 (primary): Blob + a.click() — proven reliable in v3.0.2
+    try {
+      var blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = fn; a.style.display = 'none';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function() { URL.revokeObjectURL(url); }, 2000);
+      log('💾 已下载: ' + fn, 'success');
+      return true;
+    } catch(e) {
+      log('⚠️ a.click 下载失败: ' + e.message + ', 尝试 GM_download', 'warn');
+    }
+
+    // Tier 2 (fallback): GM_download
+    if (typeof GM_download !== 'undefined') {
+      try {
+        var blob2 = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+        var url2 = URL.createObjectURL(blob2);
+        await new Promise(function(resolve, reject) {
+          GM_download({
+            url: url2,
+            name: fn,
+            saveAs: false,
+            onload: function() { resolve(); },
+            onerror: function(err) { reject(err); },
+            ontimeout: function() { reject(new Error('timeout')); }
+          });
+        });
+        setTimeout(function() { URL.revokeObjectURL(url2); }, 2000);
+        log('💾 GM_download 成功: ' + fn, 'success');
+        return true;
+      } catch(e2) {
+        log('⚠️ GM_download 也失败: ' + (e2.message || JSON.stringify(e2)), 'warn');
+      }
+    }
+
+    // Tier 3 (last resort): data: URI
+    try {
+      var dataUri = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(text);
+      var a3 = document.createElement('a');
+      a3.href = dataUri; a3.download = fn; a3.style.display = 'none';
+      document.body.appendChild(a3); a3.click(); document.body.removeChild(a3);
+      log('💾 data:URI 下载: ' + fn, 'success');
+      return true;
+    } catch(e3) {
+      log('❌ 所有下载方式均失败: ' + e3.message + ', 回答已在剪贴板', 'error');
+    }
+
+    return false;
+  }
+
+  // ==================== ★ v3.0.2 主上传引擎（劫持原生文件对话框） ====================
+  async function uploadOneFile(item) {
+    var name=item.name, file=item.file, handle=item.handle, cfg=getConfig();
+    log('📤 处理: '+name, 'info');
+
+    try {
+      var fileObj = file;
+      if (!fileObj && handle) fileObj = await handle.getFile();
+      if (!fileObj) { log('❌ 无法读取: '+name, 'error'); return false; }
+
+      // ★ Step 1: 先劫持 file input，再触发上传流程
+      //    千问内部会调用 input.showPicker() → 被我们拦截 → 直接注入文件
+      patchFileInputHooks(fileObj);
+
+      // Step 2: 找到附件按钮
+      var ab = findAttachButton();
+      if (!ab) { log('❌ 未找到附件按钮', 'error'); unpatchFileInputHooks(); return false; }
+      log('🖱 点击附件按钮', 'info');
+      nativeClick(ab);
+      await sleep(800);
+
+      // Step 3: 点击弹出菜单中的"上传文档"
+      var menuItem = document.querySelector('[role="menuitem"]');
+      if (!menuItem || (menuItem.textContent||'').trim() !== '上传文档') {
+        // 尝试找所有 menuitem
+        var menuItems = document.querySelectorAll('[role="menuitem"]');
+        for (var mi = 0; mi < menuItems.length; mi++) {
+          if ((menuItems[mi].textContent||'').trim() === '上传文档') {
+            menuItem = menuItems[mi]; break;
+          }
+        }
+      }
+      if (menuItem) {
+        log('🖱 点击菜单项: 上传文档', 'info');
+        nativeClick(menuItem);
+      } else {
+        log('⚠️ 未找到"上传文档"菜单项', 'warn');
+      }
+
+      // Step 4: 等待千问 React 调用 showOpenFilePicker
+      //     → 我们的劫持阻止原生对话框，直接注入文件
+      await sleep(3500);
+
+      // 检查文件是否被注入
+      var fileWasSet = _pwInjected;
+      if (fileWasSet) {
+        log('✅ 文件劫持已触发, 千问正在处理...', 'success');
+      } else {
+        // 劫持未触发！尝试直接找 input 设置
+        log('⚠️ showOpenFilePicker 拦截未触发, 尝试直接注入', 'warn');
+        var directInput = findFileInput();
+        if (directInput && _pwPendingFile) {
+          setFileToInput(directInput, _pwPendingFile);
+          _pwPendingFile = null;
+          fileWasSet = true;
+        }
+      }
+
+      if (!fileWasSet) {
+        log('❌ 无法注入文件', 'error');
+        unpatchFileInputHooks();
+        return false;
+      }
+
+      _pwPendingFile = null; // 清理
+
+      // Step 5: 等待文件解析
+      var parseWait = cfg.fileParseWaitSeconds * 1000;
+      log('📎 等待'+Math.round(parseWait/1000)+'秒解析文件...', 'info');
+      await sleep(parseWait);
+
+      // Step 6: 输入 Prompt
+      var promptOk = false;
+      if (cfg.autoPrompt && cfg.promptText) {
+        promptOk = await typePromptIntoChat(getRotatedPrompt());
+        if (promptOk) {
+          await sleep(800);
+          var ed = findInputBox();
+          if (ed) {
+            var t = (ed.textContent||ed.value||'').trim();
+            if (t.length < 20) {
+              ed.focus();
+              if (ed.contentEditable==='true') ed.textContent = cfg.promptText;
+              else ed.value = cfg.promptText;
+              ed.dispatchEvent(new InputEvent('input',{bubbles:true,composed:true,inputType:'insertText'}));
+              await sleep(500);
+              promptOk = ((ed.textContent||ed.value||'').trim().length > 20);
+            }
+          }
+        }
+      }
+      if (cfg.autoPrompt && cfg.promptText && !promptOk) {
+        log('⏭ 跳过(Prompt失败): '+name, 'warn');
+        unpatchFileInputHooks();
+        return false;
+      }
+
+      // Step 7: ★ 启动网络拦截 → 拍快照 → 发送
+      await sleep(cfg.sendDelaySeconds * 1000);
+      startCollecting();
+      var snapshot = countMessageBubbles();
+      log('📸 快照: '+snapshot.rounds+'轮, 网络拦截已启动', 'info');
+
+      clickSendButton();
+
+      // Step 8: 等待回答
+      var responseText = await waitForResponseComplete(snapshot);
+
+      if (responseText) {
+        var v = isValidResponse(responseText, cfg.promptText);
+        if (v.valid) {
+          log('valid response: '+v.reason, 'success');
+          var title = extractTitle(responseText, name);
+          var s = await saveResponse(responseText, title, cfg, name);
+          if(s) { log('saved: '+title+'.md', 'success'); persistLog('DONE: '+name, 'success'); }
+          else { log('save failed', 'warn'); persistLog('SAVEFAIL: '+name, 'warn'); }
+          addUploaded(name, 'success');
+          STATE.consecutiveFailures=0; updateStats();
+          unpatchFileInputHooks(); return true;
+        } else {
+          log('INVALID: '+v.reason, 'error');
+          persistLog('INVALID: '+name+' - '+v.reason, 'error');
+          addUploaded(name, 'invalid');
+          STATE.consecutiveFailures++; updateStats();
+          unpatchFileInputHooks();
+          await cooldownAndWake(cfg); return false;
+        }
+      } else {
+        log('no response', 'warn');
+        persistLog('NOREPLY: '+name, 'warn');
+        addUploaded(name, 'no_response');
+        STATE.consecutiveFailures++; updateStats();
+        if(STATE.consecutiveFailures>=2){unpatchFileInputHooks();await cooldownAndWake(cfg);return false;}
+      }
+
+      unpatchFileInputHooks();
+      return false;
+    } catch(e) {
+      stopCollecting();
+      unpatchFileInputHooks();
+      log('❌ 异常: '+name+' - '+e.message, 'error'); return false;
+    }
+  }
+
+  // ==================== 批量循环 ====================
+  async function runUploadLoop() {
+    var cfg = getConfig();
+    STATE.running = true; STATE.paused = false; updateButtons();
+    log('▶ 开始: '+STATE.queue.length+'个文件, 间隔'+cfg.intervalMinutes+'分, 网络拦截模式', 'info');
+
+    for (var i=0; i<STATE.queue.length; i++) {
+      while (STATE.paused && STATE.running) await sleep(1000);
+      if (!STATE.running) { log('⏹ 已停止', 'warn'); break; }
+      STATE.currentIndex = i; updateStats(); updateQueueList();
+      var item = STATE.queue[i];
+      if (getUploadedSet().has(item.name)) { log('⏭ 跳过: '+item.name, 'info'); continue; }
+      await uploadOneFile(item);
+      if (i < STATE.queue.length-1) {
+        var wait = Math.max(30000, cfg.intervalMinutes*60000 + (Math.random()-0.5)*60000);
+        log('⏰ 等待'+Math.round(wait/1000)+'秒...', 'info');
+        var ws = Date.now();
+        while (Date.now()-ws < wait) { while (STATE.paused && STATE.running) await sleep(1000); if (!STATE.running) break; await sleep(1000); }
+      }
+    }
+    STATE.running = false; STATE.paused = false; STATE.currentIndex = -1;
+    updateButtons(); updateStats(); log('✅ 上传结束', 'success');
+  }
+
+  // ==================== 队列管理 ====================
+  async function buildQueueFromDir() {
+    if (!STATE.dirHandle) return;
+    var files = await listPdfFiles(STATE.dirHandle);
+    STATE.queue = files.map(function(f){return{name:f.name,handle:f.handle};});
+    log('📋 加载'+files.length+'个PDF', 'info'); updateStats(); updateQueueList();
+  }
+  function addToQueueFromDrop(files) {
+    var ex = new Set(STATE.queue.map(function(q){return q.name;})), added=0;
+    for (var i=0; i<files.length; i++) {
+      if (!ex.has(files[i].name)) { STATE.queue.push({name:files[i].name,file:files[i].file}); added++; }
+    }
+    if (added>0) { log('📥 拖拽添加'+added+'个PDF', 'info'); updateStats(); updateQueueList(); }
+  }
+
+  // ==================== File System Access ====================
+  async function pickFolder() {
+    if (typeof showDirectoryPicker === 'undefined') { log('❌ 浏览器不支持, 请拖拽', 'error'); return null; }
+    try {
+      var h = await window.showDirectoryPicker({mode:'read'});
+      await storeDirHandle(h);
+      STATE.dirHandle = h; STATE.config.folderDisplayName = h.name; saveConfig(); updateFolderDisplay();
+      log('📂 已选择: '+h.name, 'success'); return h;
+    } catch(e) { if (e.name!=='AbortError') log('❌ 选择失败: '+e.message, 'error'); return null; }
+  }
+  async function listPdfFiles(h) {
+    var files = [];
+    for await (var e of h.entries()) { if (e[1].kind==='file' && e[0].toLowerCase().endsWith('.pdf')) files.push({name:e[0],handle:e[1]}); }
+    files.sort(function(a,b){return a.name.localeCompare(b.name,'zh');});
+    return files;
+  }
+  async function getFileFromHandle(h) { return h.getFile(); }
+
+  // ==================== IndexedDB ====================
+  function openDB() {
+    return new Promise(function(ok,err) {
+      var req = indexedDB.open('QwenPdf3',1);
+      req.onupgradeneeded = function(){ if(!req.result.objectStoreNames.contains('h')) req.result.createObjectStore('h'); };
+      req.onsuccess = function(){ok(req.result);}; req.onerror = function(){err(req.error);};
+    });
+  }
+  async function storeDirHandle(h) {
+    var db = await openDB();
+    return new Promise(function(ok,err){var tx=db.transaction('h','readwrite'); tx.objectStore('h').put(h,'dir'); tx.oncomplete=ok; tx.onerror=err;});
+  }
+  async function loadDirHandle() {
+    try {
+      var db = await openDB();
+      var h = await new Promise(function(res){var tx=db.transaction('h','readonly'); var r=tx.objectStore('h').get('dir'); r.onsuccess=function(){res(r.result);}; r.onerror=function(){res(null);};});
+      if (!h) return null;
+      var p = await h.queryPermission({mode:'read'});
+      if (p==='granted') return h;
+      if (p==='prompt' && await h.requestPermission({mode:'read'})==='granted') return h;
+      var db2=await openDB(), tx=db2.transaction('h','readwrite'); tx.objectStore('h').delete('dir');
+      return null;
+    }catch(e){return null;}
+  }
+
+  // ==================== 拖拽 ====================
+  async function handleDropEntries(items) {
+    var files = [];
+    for (var i=0; i<items.length; i++) {
+      if (items[i].kind!=='file') continue;
+      var entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+      if (!entry) continue;
+      var c = await collectFiles(entry);
+      for (var j=0; j<c.length; j++) files.push(c[j]);
+    }
+    return files;
+  }
+  async function collectFiles(entry) {
+    var r = [];
+    if (entry.isFile) {
+      if (entry.name.toLowerCase().endsWith('.pdf')) {
+        var f = await new Promise(function(res){entry.file(res);});
+        r.push({name:f.name,file:f});
+      }
+    } else if (entry.isDirectory) {
+      var reader = entry.createReader();
+      var batch;
+      do {
+        batch = await new Promise(function(res){reader.readEntries(res);});
+        for (var i=0; i<batch.length; i++) { var sub = await collectFiles(batch[i]); for (var j=0; j<sub.length; j++) r.push(sub[j]); }
+      } while (batch.length>0);
+    }
+    return r;
+  }
+
+  // ==================== 日志 ====================
+  function log(msg, level) {
+    var time = new Date().toTimeString().slice(0,8);
+    var icons = {info:'ℹ️',success:'✅',warn:'⚠️',error:'❌'};
+    var line = '['+time+'] '+(icons[level]||'ℹ️')+' '+msg;
+    if (STATE.ui.logContainer) {
+      var e = document.createElement('div');
+      e.className = 'qw-log-entry qw-log-'+(level||'info');
+      e.textContent = line;
+      STATE.ui.logContainer.appendChild(e);
+      STATE.ui.logContainer.scrollTop = STATE.ui.logContainer.scrollHeight;
+    }
+    if (level==='error') console.error(line); else if (level==='warn') console.warn(line); else console.log(line);
+    persistLog(msg, level);
+  }
+
+  // ==================== UI ====================
+  function createPanel() {
+    GM_addStyle(
+'#qw-uploader-panel{position:fixed;top:100px;right:20px;z-index:99999;width:440px;max-height:85vh;background:#1a1a2e;color:#e0e0e0;border-radius:12px;box-shadow:0 8px 40px rgba(0,0,0,0.5);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:13px;line-height:1.5;display:flex;flex-direction:column;overflow:hidden;border:1px solid #2a2a4a;user-select:none;}'+
+'#qw-uploader-panel.qw-collapsed{width:48px;height:48px;border-radius:24px;}#qw-uploader-panel.qw-collapsed .qw-content{display:none;}#qw-uploader-panel.qw-collapsed .qw-header-text{display:none;}'+
+'.qw-header{display:flex;align-items:center;padding:10px 14px;background:linear-gradient(135deg,#16213e 0%,#1a1a2e 100%);border-bottom:1px solid #2a2a4a;cursor:move;border-radius:12px 12px 0 0;gap:8px;}'+
+'.qw-header-icon{font-size:18px;}.qw-header-text{font-weight:600;font-size:14px;white-space:nowrap;}.qw-header-spacer{flex:1;}'+
+'.qw-header-btn{background:none;border:1px solid #3a3a5a;color:#aaa;border-radius:6px;cursor:pointer;padding:4px 8px;font-size:12px;}.qw-header-btn:hover{background:#3a3a5a;color:#fff;}'+
+'.qw-content{flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px;}'+
+'.qw-section{display:flex;flex-direction:column;gap:6px;}.qw-section-title{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6a6a8a;margin-bottom:2px;}'+
+'.qw-row{display:flex;align-items:center;gap:8px;}.qw-label{color:#aaa;font-size:12px;min-width:54px;white-space:nowrap;}'+
+'.qw-btn{padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500;}'+
+'.qw-btn-primary{background:#10b981;color:#fff;}.qw-btn-success{background:#10b981;color:#fff;}'+
+'.qw-btn-warn{background:#f59e0b;color:#fff;}.qw-btn-danger{background:#ef4444;color:#fff;}'+
+'.qw-btn-outline{background:transparent;border:1px solid #10b981;color:#10b981;}.qw-btn-outline:hover{background:rgba(16,185,129,.1);}'+
+'.qw-btn:disabled{opacity:.4;cursor:not-allowed;}.qw-btn-sm{padding:4px 10px;font-size:11px;}'+
+'.qw-input{background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:6px 10px;font-size:12px;width:60px;text-align:center;}.qw-input:focus{outline:none;border-color:#10b981;}'+
+'.qw-folder-display{flex:1;padding:6px 10px;background:#16213e;border:1px dashed #3a3a5a;border-radius:6px;color:#6a6a8a;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}'+
+'.qw-folder-display.active{color:#10b981;border-color:#10b981;border-style:solid;}'+
+'.qw-stats{display:flex;gap:12px;padding:8px 12px;background:#16213e;border-radius:8px;font-size:12px;color:#aaa;}'+
+'.qw-stat-value{color:#10b981;font-weight:600;}.qw-stat-value.warn{color:#f59e0b;}'+
+'.qw-progress-bar{height:6px;background:#2a2a4a;border-radius:3px;overflow:hidden;margin-top:4px;}'+
+'.qw-progress-fill{height:100%;background:linear-gradient(90deg,#10b981,#059669);border-radius:3px;transition:width .3s;}'+
+'.qw-log-container{background:#0d0d1a;border-radius:8px;padding:8px;max-height:200px;overflow-y:auto;font-family:"JetBrains Mono","Fira Code","Consolas",monospace;font-size:11px;line-height:1.6;}'+
+'.qw-log-info{color:#a0a0c0;}.qw-log-success{color:#10b981;}.qw-log-warn{color:#f59e0b;}.qw-log-error{color:#ef4444;font-weight:600;}'+
+'.qw-queue-list{max-height:120px;overflow-y:auto;background:#16213e;border-radius:6px;padding:4px 8px;}'+
+'.qw-queue-item{padding:3px 6px;border-radius:4px;font-size:11px;color:#aaa;display:flex;align-items:center;gap:6px;}'+
+'.qw-queue-item.current{background:rgba(16,185,129,.15);color:#10b981;font-weight:600;}.qw-queue-item.done{color:#10b981;}'+
+'.qw-divider{border:none;border-top:1px solid #2a2a4a;margin:4px 0;}'+
+'.qw-drop-overlay{position:fixed;inset:0;z-index:99998;background:rgba(16,185,129,.15);border:3px dashed #10b981;display:none;align-items:center;justify-content:center;pointer-events:none;}.qw-drop-overlay.active{display:flex;}'+
+'.qw-drop-text{background:rgba(26,26,46,.95);color:#10b981;padding:24px 48px;border-radius:16px;font-size:20px;font-weight:700;}'+
+'.qw-content::-webkit-scrollbar,.qw-log-container::-webkit-scrollbar,.qw-queue-list::-webkit-scrollbar{width:4px;}'+
+'.qw-content::-webkit-scrollbar-thumb,.qw-log-container::-webkit-scrollbar-thumb,.qw-queue-list::-webkit-scrollbar-thumb{background:#3a3a5a;border-radius:2px;}'+
+'.qw-prompt-tab{padding:5px 10px;border-radius:6px 6px 0 0;background:#0d0d1a;color:#6a6a8a;font-size:11px;cursor:pointer;border:1px solid transparent;display:inline-block;}'+
+'.qw-prompt-tab:hover{color:#aaa;background:#16213e;}.qw-prompt-tab.active{background:#16213e;color:#10b981;border-color:#2a2a4a;border-bottom-color:#16213e;font-weight:600;}'+
+'.qw-queue-item{cursor:pointer;}.qw-queue-item.invalid{color:#ef4444;}.qw-queue-item.selected{background:rgba(245,158,11,.15);color:#f59e0b;}'
+    );
+
+    var dropOverlay = document.createElement('div');
+    dropOverlay.id = DROP_OVERLAY_ID;
+    dropOverlay.className = 'qw-drop-overlay';
+    dropOverlay.innerHTML = '<div class="qw-drop-text">📂 释放以上传 PDF</div>';
+    document.body.appendChild(dropOverlay);
+
+    var cfg = getConfig();
+    var panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.innerHTML =
+'<div class="qw-header" id="qw-header-drag">'+
+' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.0.0</span>'+
+' <span class="qw-header-spacer"></span>'+
+' <button class="qw-header-btn" id="qw-btn-minimize" title="最小化">−</button>'+
+'</div>'+
+'<div class="qw-content" id="qw-content">'+
+' <div class="qw-section">'+
+'  <div class="qw-section-title">📂 文件夹 (网络拦截模式)</div>'+
+'  <div class="qw-row">'+
+'   <span class="qw-folder-display" id="qw-folder-display">未选择（也支持拖拽）</span>'+
+'   <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-pick">选择</button>'+
+'   <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-refresh" disabled>🔄</button>'+
+'  </div>'+
+' </div>'+
+' <hr class="qw-divider">'+
+' <div class="qw-section">'+
+'  <div class="qw-section-title">⏱ 时间设置</div>'+
+'  <div class="qw-row"><span class="qw-label">文件解析</span><input type="number" class="qw-input" id="qw-input-parse" min="3" step="1" value="'+cfg.fileParseWaitSeconds+'"><span style="color:#999;font-size:11px;">秒 — 上传后等待</span></div>'+
+'  <div class="qw-row"><span class="qw-label">发送延迟</span><input type="number" class="qw-input" id="qw-input-send-delay" min="1" step="1" value="'+cfg.sendDelaySeconds+'"><span style="color:#999;font-size:11px;">秒 — Prompt→发送</span></div>'+
+'  <div class="qw-row"><span class="qw-label">回答超时</span><input type="number" class="qw-input" id="qw-input-timeout" min="1" step="1" value="'+cfg.responseTimeoutMinutes+'"><span style="color:#999;font-size:11px;">分</span></div>'+
+'  <div class="qw-row"><span class="qw-label">稳定判定</span><input type="number" class="qw-input" id="qw-input-stable" min="3" step="1" value="'+cfg.responseStableSeconds+'"><span style="color:#999;font-size:11px;">秒 — N秒不变→完成</span></div>'+
+'  <div class="qw-row"><span class="qw-label">最短等待</span><input type="number" class="qw-input" id="qw-input-minwait" min="10" step="1" value="'+cfg.responseMinWaitSeconds+'"><span style="color:#999;font-size:11px;">秒 — 至少等N秒</span></div>'+
+'  <div class="qw-row"><span class="qw-label">冷却时间</span><input type="number" class="qw-input" id="qw-input-cooldown" min="10" step="10" value="'+(cfg.cooldownMinutes||120)+'" style="width:50px;"><span style="color:#999;font-size:11px;">分(无效后冷却)</span></div>'+
+'  <div class="qw-row"><span class="qw-label">时间窗口</span><input type="time" id="qw-input-schedule-start" style="background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:4px 6px;font-size:11px;width:100px;" value="'+(cfg.scheduleStart||'')+'"><span style="color:#aaa;font-size:11px;">-</span><input type="time" id="qw-input-schedule-end" style="background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:4px 6px;font-size:11px;width:100px;" value="'+(cfg.scheduleEnd||'')+'"><span style="color:#aaa;font-size:10px;" id="qw-schedule-status">(off)</span></div>'+
+' </div>'+
+' <hr class="qw-divider">'+
+' <div class="qw-section">'+
+'  <div class="qw-section-title">⚙️ 其他</div>'+
+'  <div class="qw-row"><span class="qw-label">文件间隔</span><input type="number" class="qw-input" id="qw-input-interval" min="0.1" step="0.5" value="'+cfg.intervalMinutes+'"><span style="color:#aaa;font-size:12px;">分钟</span></div>'+
+'  <div class="qw-row"><label style="color:#aaa;font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="qw-checkbox-autoprompt"'+(cfg.autoPrompt!==false?' checked':'')+'> 自动输入Prompt</label></div>'+
+'  <div class="qw-row"><label style="color:#aaa;font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="qw-checkbox-autosave"'+(cfg.autoSave!==false?' checked':'')+'> 自动下载回答</label></div>'+
+' </div>'+
+' <hr class="qw-divider">'+
+' <div class="qw-section">'+
+'  <div class="qw-section-title">📝 Prompt模板 (轮换)</div>'+
+'  <div style="display:flex;gap:2px;margin-bottom:2px;"><span class="qw-prompt-tab active" data-tab="0">#0</span><span class="qw-prompt-tab" data-tab="1">#1</span></div>'+
+'  <textarea id="qw-textarea-prompt" style="width:100%;height:60px;background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:0 6px 6px 6px;padding:6px 10px;font-size:11px;line-height:1.4;resize:vertical">'+escHtml(cfg.promptText||DEFAULT_PROMPT)+'</textarea>'+
+'  <div class="qw-row" style="gap:6px;margin-top:2px;"><label style="color:#aaa;font-size:11px;display:flex;align-items:center;gap:3px;"><input type="checkbox" id="qw-checkbox-auto-rotate" checked> 自动轮换</label><span style="color:#6a6a8a;font-size:10px;" id="qw-rotate-index">轮换: -</span></div>'+
+'  <div class="qw-row" style="gap:6px"><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-save-prompt">保存</button><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-reset-prompt">恢复默认</button></div>'+
+' </div>'+
+' <hr class="qw-divider">'+
+' <div class="qw-stats" id="qw-stats">'+
+'  <span>队列:<span class="qw-stat-value" id="qw-queue-count">0</span></span>'+
+'  <span>已完成:<span class="qw-stat-value" id="qw-uploaded-count">0</span></span>'+
+'  <span>当前:<span class="qw-stat-value warn" id="qw-current-file">-</span></span>'+
+' </div>'+
+' <div class="qw-progress-bar"><div class="qw-progress-fill" id="qw-progress-fill" style="width:0%"></div></div>'+
+' <div class="qw-section"><div class="qw-section-title">📋 队列</div><div class="qw-queue-list" id="qw-queue-list"><div style="color:#6a6a8a;font-size:11px;">暂无文件</div></div></div>'+
+' <div class="qw-row" style="gap:6px;flex-wrap:wrap">'+
+'  <button class="qw-btn qw-btn-success" id="qw-btn-start" disabled>▶ 开始</button>'+
+'  <button class="qw-btn qw-btn-warn" id="qw-btn-pause" disabled>⏸ 暂停</button>'+
+'  <button class="qw-btn qw-btn-danger" id="qw-btn-stop" disabled>⏹ 停止</button>'+
+'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-reset">🔄 重置</button>'+
+'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-export-log">📜 导出日志</button>'+
+'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-import-log">📥 读取日志</button>'+
+'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-retry-failed" disabled>🔁 重试失败</button>'+
+'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-upload-selected" disabled>📌 上传选中</button>'+
+' </div>'+
+' <div class="qw-row" style="gap:4px;margin-top:4px;"><input type="text" id="qw-input-range" style="flex:1;background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:4px 8px;font-size:11px;" placeholder="按序号: 1,3,5-10"><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-upload-range">上传指定</button></div>'+
+' <hr class="qw-divider">'+
+' <div class="qw-section"><div class="qw-section-title">📜 日志</div><div class="qw-log-container" id="qw-log-container"><div class="qw-log-entry qw-log-info">🚀 Pro v4.0.0 已启动</div><div class="qw-log-entry qw-log-info">📌 选择文件夹或拖拽PDF开始</div></div></div>'+
+'</div>';
+    document.body.appendChild(panel);
+
+    STATE.ui = {
+      panel:panel,
+      folderDisplay:panel.querySelector('#qw-folder-display'),
+      btnPick:panel.querySelector('#qw-btn-pick'), btnRefresh:panel.querySelector('#qw-btn-refresh'),
+      btnStart:panel.querySelector('#qw-btn-start'), btnPause:panel.querySelector('#qw-btn-pause'),
+      btnStop:panel.querySelector('#qw-btn-stop'), btnReset:panel.querySelector('#qw-btn-reset'),
+      btnMinimize:panel.querySelector('#qw-btn-minimize'),
+      headerDrag:panel.querySelector('#qw-header-drag'),
+      inputParse:panel.querySelector('#qw-input-parse'), inputSendDelay:panel.querySelector('#qw-input-send-delay'),
+      inputTimeout:panel.querySelector('#qw-input-timeout'), inputStable:panel.querySelector('#qw-input-stable'),
+      inputMinWait:panel.querySelector('#qw-input-minwait'), inputInterval:panel.querySelector('#qw-input-interval'),
+      inputCooldown:panel.querySelector('#qw-input-cooldown'),
+      inputScheduleStart:panel.querySelector('#qw-input-schedule-start'), inputScheduleEnd:panel.querySelector('#qw-input-schedule-end'),
+      scheduleStatus:panel.querySelector('#qw-schedule-status'),
+      checkboxAutoPrompt:panel.querySelector('#qw-checkbox-autoprompt'), checkboxAutoSave:panel.querySelector('#qw-checkbox-autosave'),
+      checkboxAutoRotate:panel.querySelector('#qw-checkbox-auto-rotate'),
+      rotateIndex:panel.querySelector('#qw-rotate-index'),
+      textareaPrompt:panel.querySelector('#qw-textarea-prompt'),
+      btnSavePrompt:panel.querySelector('#qw-btn-save-prompt'), btnResetPrompt:panel.querySelector('#qw-btn-reset-prompt'),
+      btnExportLog:panel.querySelector('#qw-btn-export-log'), btnImportLog:panel.querySelector('#qw-btn-import-log'),
+      btnRetryFailed:panel.querySelector('#qw-btn-retry-failed'), btnUploadSelected:panel.querySelector('#qw-btn-upload-selected'),
+      btnUploadRange:panel.querySelector('#qw-btn-upload-range'), inputRange:panel.querySelector('#qw-input-range'),
+      queueCount:panel.querySelector('#qw-queue-count'), uploadedCount:panel.querySelector('#qw-uploaded-count'),
+      currentFile:panel.querySelector('#qw-current-file'), progressFill:panel.querySelector('#qw-progress-fill'),
+      queueList:panel.querySelector('#qw-queue-list'), logContainer:panel.querySelector('#qw-log-container'),
+      dropOverlay:dropOverlay
+    };
+
+    bindUI(); bindDrag(); bindDrop();
+    return panel;
+  }
+
+  function bindUI() {
+    var ui = STATE.ui;
+    ui.btnPick.addEventListener('click', async function(){ var h=await pickFolder(); if(h){await buildQueueFromDir();ui.btnRefresh.disabled=false;ui.btnStart.disabled=STATE.queue.length===0;} });
+    ui.btnRefresh.addEventListener('click', async function(){ if(STATE.dirHandle){await buildQueueFromDir();ui.btnStart.disabled=STATE.queue.length===0;} });
+
+    function cfgInt(el, key, min) { el.addEventListener('change', function(){ var v=parseInt(el.value)||min; STATE.config[key]=Math.max(min,v); el.value=STATE.config[key]; saveConfig(); }); }
+    cfgInt(ui.inputParse, 'fileParseWaitSeconds', 3);
+    cfgInt(ui.inputSendDelay, 'sendDelaySeconds', 1);
+    cfgInt(ui.inputTimeout, 'responseTimeoutMinutes', 1);
+    cfgInt(ui.inputStable, 'responseStableSeconds', 3);
+    cfgInt(ui.inputMinWait, 'responseMinWaitSeconds', 10);
+
+    ui.inputInterval.addEventListener('change', function(){ var v=parseFloat(ui.inputInterval.value); if(v>0){STATE.config.intervalMinutes=v;saveConfig();} });
+    ui.checkboxAutoPrompt.addEventListener('change', function(){ STATE.config.autoPrompt=ui.checkboxAutoPrompt.checked;saveConfig(); });
+    ui.checkboxAutoSave.addEventListener('change', function(){ STATE.config.autoSave=ui.checkboxAutoSave.checked;saveConfig(); });
+    ui.btnSavePrompt.addEventListener('click', function(){ STATE.config.promptText=ui.textareaPrompt.value;saveConfig();log('✅ Prompt已保存','success'); });
+    ui.btnResetPrompt.addEventListener('click', function(){ ui.textareaPrompt.value=DEFAULT_PROMPT; STATE.config.promptText=DEFAULT_PROMPT;saveConfig();log('🔄 已恢复默认','info'); });
+
+    ui.btnStart.addEventListener('click', async function(){
+      if (STATE.queue.length===0) { log('⚠️ 队列为空','warn'); return; }
+      if (STATE.running) return;
+      ui.btnStart.disabled=true; ui.btnPause.disabled=false; ui.btnStop.disabled=false;
+      await runUploadLoop();
+    });
+    ui.btnPause.addEventListener('click', function(){ if(!STATE.running)return; STATE.paused=!STATE.paused; ui.btnPause.textContent=STATE.paused?'▶ 继续':'⏸ 暂停'; log(STATE.paused?'⏸ 已暂停':'▶ 已恢复','warn'); });
+    ui.btnStop.addEventListener('click', function(){ STATE.running=false; STATE.paused=false; stopCollecting(); updateButtons(); log('⏹ 已停止','warn'); });
+    ui.btnReset.addEventListener('click', function(){ if(confirm('清除上传记录？')){ clearUploaded(); updateStats(); updateQueueList(); log('🔄 已重置','warn'); } });
+    ui.btnMinimize.addEventListener('click', function(){ STATE.ui.panel.classList.toggle('qw-collapsed'); });
+
+    // v4.0.0 new handlers (safety-checked)
+    if(ui.inputCooldown) ui.inputCooldown.addEventListener('change',function(){var v=parseInt(ui.inputCooldown.value)||120;STATE.config.cooldownMinutes=Math.max(10,v);saveConfig();});
+    if(ui.inputScheduleStart) ui.inputScheduleStart.addEventListener('change',function(){STATE.config.scheduleStart=ui.inputScheduleStart.value;saveConfig();updateScheduleStatus();});
+    if(ui.inputScheduleEnd) ui.inputScheduleEnd.addEventListener('change',function(){STATE.config.scheduleEnd=ui.inputScheduleEnd.value;saveConfig();updateScheduleStatus();});
+    if(ui.checkboxAutoRotate) ui.checkboxAutoRotate.addEventListener('change',function(){STATE.config.autoRotateEnabled=ui.checkboxAutoRotate.checked;saveConfig();updateRotateIndex();});
+
+    // Prompt tabs
+    if(ui.textareaPrompt&&ui.textareaPrompt.parentElement){
+      var tabs=ui.textareaPrompt.parentElement.querySelectorAll('.qw-prompt-tab');
+      for(var ti=0;ti<tabs.length;ti++){
+        tabs[ti].addEventListener('click',function(e){
+          var t=parseInt(e.target.dataset.tab);
+          if(!isNaN(t)){STATE.config.activePromptTab=t;ui.textareaPrompt.value=PROMPT_POOL[t]||DEFAULT_PROMPT;saveConfig();
+            var allT=ui.textareaPrompt.parentElement.querySelectorAll('.qw-prompt-tab');
+            for(var aj=0;aj<allT.length;aj++)allT[aj].classList.toggle('active',parseInt(allT[aj].dataset.tab)===t);
+          }
+        });
+      }
+    }
+
+    // Export/Import log
+    if(ui.btnExportLog) ui.btnExportLog.addEventListener('click',function(){exportLogToFile();log('log exported','success');});
+    if(ui.btnImportLog) ui.btnImportLog.addEventListener('click',function(){
+      var inp=document.createElement('input');inp.type='file';inp.accept='.txt';inp.style.display='none';
+      document.body.appendChild(inp);
+      inp.addEventListener('change',async function(e){
+        var f=e.target.files[0];if(!f){document.body.removeChild(inp);return;}
+        try{var t=await f.text();var r=parseLogAndRestore(t);log('restored '+r+' records','success');updateStats();updateQueueList();updateRetryFailedButton();}catch(err){log('import fail: '+err.message,'error');}
+        document.body.removeChild(inp);
+      });
+      inp.click();
+    });
+
+    // Retry
+    if(ui.btnRetryFailed) ui.btnRetryFailed.addEventListener('click',async function(){
+      if(STATE.running)return;
+      var recs=getUploadRecords();
+      var failed=recs.filter(function(r){return r.status==='invalid'||r.status==='no_response';}).map(function(r){return r.name;});
+      if(!failed.length){log('no failed','warn');return;}
+      for(var f=0;f<failed.length;f++)removeUploaded(failed[f]);
+      updateStats();updateQueueList();
+      var rq=STATE.queue.filter(function(q){return failed.indexOf(q.name)>=0;});
+      STATE.running=true;STATE.paused=false;updateButtons();
+      for(var ri=0;ri<rq.length;ri++){
+        while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;
+        log('retry['+(ri+1)+'/'+rq.length+']: '+rq[ri].name,'info');
+        await uploadOneFile(rq[ri]);
+        if(ri<rq.length-1&&STATE.running){var w=Math.max(30000,getConfig().intervalMinutes*60000);var ws=Date.now();while(Date.now()-ws<w){while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;await sleep(1000);}}
+      }
+      STATE.running=false;STATE.paused=false;updateButtons();updateStats();updateQueueList();updateRetryFailedButton();
+    });
+
+    // Upload selected
+    if(ui.btnUploadSelected) ui.btnUploadSelected.addEventListener('click',async function(){
+      var sel=Object.keys(selectedFiles).filter(function(k){return selectedFiles[k];});
+      if(!sel.length){log('none selected','warn');return;}
+      if(STATE.running)return;
+      var sq=STATE.queue.filter(function(q){return selectedFiles[q.name];});
+      for(var s=0;s<sq.length;s++)removeUploaded(sq[s].name);
+      updateStats();updateQueueList();
+      STATE.running=true;STATE.paused=false;updateButtons();
+      for(var si=0;si<sq.length;si++){
+        while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;
+        log('sel['+(si+1)+'/'+sq.length+']: '+sq[si].name,'info');
+        await uploadOneFile(sq[si]);
+        if(si<sq.length-1&&STATE.running){var w2=Math.max(30000,getConfig().intervalMinutes*60000);var ws2=Date.now();while(Date.now()-ws2<w2){while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;await sleep(1000);}}
+      }
+      STATE.running=false;STATE.paused=false;
+      for(var n=0;n<sel.length;n++)selectedFiles[sel[n]]=false;
+      updateButtons();updateStats();updateQueueList();
+    });
+
+    // Upload range
+    if(ui.btnUploadRange) ui.btnUploadRange.addEventListener('click',async function(){
+      var rt=ui.inputRange.value.trim();if(!rt){log('enter range','warn');return;};
+      if(STATE.running)return;
+      var idx=parseRange(rt,STATE.queue.length);
+      if(!idx.length){log('bad range','warn');return;}
+      var rq2=idx.map(function(x){return STATE.queue[x];});
+      for(var rj=0;rj<rq2.length;rj++)removeUploaded(rq2[rj].name);
+      updateStats();updateQueueList();
+      STATE.running=true;STATE.paused=false;updateButtons();
+      for(var rk=0;rk<rq2.length;rk++){
+        while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;
+        log('range['+(rk+1)+'/'+rq2.length+'] #'+(idx[rk]+1)+': '+rq2[rk].name,'info');
+        await uploadOneFile(rq2[rk]);
+        if(rk<rq2.length-1&&STATE.running){var w3=Math.max(30000,getConfig().intervalMinutes*60000);var ws3=Date.now();while(Date.now()-ws3<w3){while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;await sleep(1000);}}
+      }
+      STATE.running=false;STATE.paused=false;updateButtons();updateStats();updateQueueList();
+    });
+
+    // Queue click to select
+    if(ui.queueList) ui.queueList.addEventListener('click',function(e){
+      var item=e.target.closest('.qw-queue-item');
+      if(!item||!item.dataset.qwidx)return;
+      var idx=parseInt(item.dataset.qwidx);
+      if(isNaN(idx)||idx>=STATE.queue.length)return;
+      var nm=STATE.queue[idx].name;
+      if(selectedFiles[nm])selectedFiles[nm]=false;else selectedFiles[nm]=true;
+      updateQueueList();
+      if(ui.btnUploadSelected){var c=Object.keys(selectedFiles).filter(function(k){return selectedFiles[k];}).length;ui.btnUploadSelected.disabled=c===0;ui.btnUploadSelected.textContent=c>0?'upload('+c+')':'upload selected';}
+    });
+  }
+
+  var dragState=null;
+  function bindDrag() {
+    STATE.ui.panel.addEventListener('mousedown', function(e){
+      if (e.target.tagName==='BUTTON'||e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.closest('label')) return;
+      if (!e.target.closest('#qw-header-drag')) return;
+      dragState={sx:e.clientX,sy:e.clientY,sl:STATE.ui.panel.offsetLeft,st:STATE.ui.panel.offsetTop};
+      document.addEventListener('mousemove', onDM); document.addEventListener('mouseup', onDU);
+    });
+  }
+  function onDM(e){ if(!dragState)return; STATE.ui.panel.style.right='auto'; STATE.ui.panel.style.top=Math.max(0,dragState.st+(e.clientY-dragState.sy))+'px'; STATE.ui.panel.style.left=Math.max(0,dragState.sl+(e.clientX-dragState.sx))+'px'; }
+  function onDU(){ dragState=null; document.removeEventListener('mousemove',onDM); document.removeEventListener('mouseup',onDU); }
+
+  function bindDrop() {
+    var dc=0;
+    document.addEventListener('dragenter',function(e){e.preventDefault();dc++;if(e.dataTransfer&&e.dataTransfer.types.indexOf('Files')>=0)STATE.ui.dropOverlay.classList.add('active');});
+    document.addEventListener('dragleave',function(e){dc--;if(dc===0)STATE.ui.dropOverlay.classList.remove('active');});
+    document.addEventListener('dragover',function(e){e.preventDefault();});
+    document.addEventListener('drop',async function(e){e.preventDefault();dc=0;STATE.ui.dropOverlay.classList.remove('active');if(!e.dataTransfer||!e.dataTransfer.items)return;var files=await handleDropEntries(Array.prototype.slice.call(e.dataTransfer.items));if(files.length>0){addToQueueFromDrop(files);STATE.ui.btnStart.disabled=false;}});
+  }
+
+  function updateFolderDisplay() {
+    var d=STATE.ui.folderDisplay, n=getConfig().folderDisplayName;
+    d.textContent=n?'📂 '+n:'未选择（也支持拖拽）'; d.classList.toggle('active',!!n);
+  }
+  function updateStats() {
+    var up=getUploadedSet(), done=0;
+    for(var i=0;i<STATE.queue.length;i++) if(up.has(STATE.queue[i].name)) done++;
+    STATE.ui.queueCount.textContent=STATE.queue.length;
+    STATE.ui.uploadedCount.textContent=done;
+    STATE.ui.currentFile.textContent=(STATE.currentIndex>=0&&STATE.currentIndex<STATE.queue.length)?STATE.queue[STATE.currentIndex].name:'-';
+    STATE.ui.progressFill.style.width=STATE.queue.length>0?(done/STATE.queue.length*100)+'%':'0%';
+  }
+  function updateQueueList() {
+    var l=STATE.ui.queueList, up=getUploadedSet();
+    var recs=getUploadRecords();
+    if (!STATE.queue.length) { l.innerHTML='<div style="color:#6a6a8a;font-size:11px;">暂无文件</div>'; return; }
+    var show=STATE.queue.slice(0,50), h='';
+    for(var i=0;i<show.length;i++){
+      var cls='',dot='○';
+      var isUp=up.has(show[i].name);
+      var rec=recs.find(function(r){return r.name===show[i].name;});
+      if(isUp){
+        if(rec&&(rec.status==='invalid'||rec.status==='no_response')){cls='invalid';dot='✗';}
+        else{cls='done';dot='●';}
+      }
+      if(i===STATE.currentIndex&&STATE.running){cls='current';dot='▶';}
+      if(selectedFiles[show[i].name]){cls='selected';dot='📌';}
+      h+='<div class="qw-queue-item '+cls+'" data-qwidx="'+i+'"><span class="qw-queue-dot">'+dot+'</span><span>'+(i+1)+'. '+escHtml(show[i].name)+'</span></div>';
+    }
+    l.innerHTML=h+(STATE.queue.length>50?'<div style="color:#6a6a8a;font-size:11px;padding:3px 6px;">...还有'+(STATE.queue.length-50)+'个</div>':'');
+  }
+  function updateButtons() {
+    var ui=STATE.ui;
+    if(STATE.running){ui.btnStart.disabled=true;ui.btnPause.disabled=false;ui.btnStop.disabled=false;ui.btnPause.textContent=STATE.paused?'▶ 继续':'⏸ 暂停';}
+    else{ui.btnStart.disabled=STATE.queue.length===0;ui.btnPause.disabled=true;ui.btnStop.disabled=true;ui.btnPause.textContent='⏸ 暂停';}
+  }
+  function escHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+
+  // ==================== 初始化 ====================
+  async function init() {
+    loadPersistedLog();
+    var c=getConfig(),ch=false;
+    if(!c.cooldownMinutes){c.cooldownMinutes=120;ch=true;}
+    if(!c.autoRotateEnabled&&c.autoRotateEnabled!==false){c.autoRotateEnabled=true;ch=true;}
+    if(ch)saveConfig();
+    STATE.lastSavedHash='';STATE.processedHashes=[];STATE.baselineFingerprints=new Set();
+    STATE.prompt_index=gmGet('prompt_index',0);
+
+    // create panel first so ui exists for logging
+    createPanel();
+    updateRotateIndex();
+    log('v4.0.0 started','info');log('fetch hijack active','info');
+
+    // restore persisted logs to panel
+    if(STATE.logBuffer.length>0&&STATE.ui.logContainer){
+      var rl=STATE.logBuffer.slice(-50);
+      for(var j=0;j<rl.length;j++){
+        var e=rl[j],t=new Date(e.time).toTimeString().slice(0,8),d=new Date(e.time).toISOString().slice(0,10);
+        var di=document.createElement('div');di.className='qw-log-entry qw-log-'+e.level;
+        di.textContent='['+d+' '+t+'] '+({info:'i',success:'+',warn:'!',error:'X'})[e.level]+' '+e.msg;
+        STATE.ui.logContainer.appendChild(di);
+      }
+      STATE.ui.logContainer.scrollTop=STATE.ui.logContainer.scrollHeight;
+    }
+
+    updateScheduleStatus();
+    if(STATE.ui.inputScheduleStart)STATE.ui.inputScheduleStart.value=c.scheduleStart||'';
+    if(STATE.ui.inputScheduleEnd)STATE.ui.inputScheduleEnd.value=c.scheduleEnd||'';
+
+    var h = await loadDirHandle();
+    if (h) {
+      STATE.dirHandle=h; STATE.config.folderDisplayName=h.name;
+      STATE.ui.folderDisplay.textContent='folder: '+h.name; STATE.ui.folderDisplay.classList.add('active');
+      STATE.ui.btnRefresh.disabled=false; saveConfig();
+      log('restored: '+h.name,'success');
+      await buildQueueFromDir(); STATE.ui.btnStart.disabled=STATE.queue.length===0;
+    } else { log('select folder or drag','info'); }
+
+    var up=getUploadedSet(); STATE.totalUploaded=up.size;
+    updateStats(); updateQueueList(); updateButtons(); updateRetryFailedButton();
+    if(up.size>0)log(up.size+' history','info');
+
+    await sleep(3000);
+    var ed=findInputBox();
+    if(ed)log('input ready','success');else log('no input','warn');
+  }
+
+  // @run-at document-start → 需要等 DOM ready
+  if (document.readyState==='loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();
