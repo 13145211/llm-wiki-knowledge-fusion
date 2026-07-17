@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         千问 PDF 批量上传器 Pro
 // @namespace    https://github.com/qclaw/qianwen-pdf-uploader
-// @version      4.0.0
-// @description  v4.0.0: Prompt轮换|回答验证|日志|时间窗口|重试
+// @version      4.1.0
+// @description  v4.1.0: 断点自动恢复|Prompt轮换|回答验证|日志|时间窗口|重试
 // @author       QClaw
 // @match        https://www.qianwen.com/*
 // @match        https://qianwen.com/*
@@ -227,6 +227,21 @@
     STATE.totalUploaded=s.size;
   }
   function getUploadRecords(){return gmGet('uploadRecords',[]);}
+
+  // ==================== 断点自动恢复（v4.1.0） ====================
+  // 根因：startNewChat() 兜底用 window.location.href 跳转，整页刷新会杀死脚本
+  // 运行环境，导致批量任务中断、只能手动重新开始。
+  // 方案：运行期间持久化"运行中"标记；页面重载后 init() 检测到标记即自动续传
+  //（已完成文件自动跳过）。标记超过 30 分钟视为过期，避免隔天打开页面突然自启。
+  var RESUME_MAX_AGE_MS = 30*60*1000;
+  function setResumeState(reason){ gmSet('resumeState', {active:true, savedAt:Date.now(), reason:reason||''}); }
+  function clearResumeState(){ gmSet('resumeState', null); }
+  function getResumeState(){
+    var st = gmGet('resumeState', null);
+    if(!st || !st.active) return null;
+    if(Date.now()-(st.savedAt||0) > RESUME_MAX_AGE_MS) return null;
+    return st;
+  }
   function updateRetryFailedButton(){
     if(!STATE.ui.btnRetryFailed)return;
     var cnt=gmGet('uploadRecords',[]).filter(function(r){return r.status==='invalid'||r.status==='no_response';}).length;
@@ -885,7 +900,7 @@
       if(inside(bs[i]))continue;var t=(bs[i].textContent||"").trim().toLowerCase();
       for(var k=0;k<kw.length;k++){if(t.indexOf(kw[k])>=0){bs[i].click();await sleep(3000);return true;}}
     }
-    try{window.location.href="/chat";await sleep(8000);return true;}catch(e){return false;}
+    try{if(STATE.running)setResumeState('新建对话-URL跳转');window.location.href="/chat";await sleep(8000);return true;}catch(e){return false;}
   }
 
   // Cooldown
@@ -1213,6 +1228,7 @@
   async function runUploadLoop() {
     var cfg = getConfig();
     STATE.running = true; STATE.paused = false; updateButtons();
+    setResumeState('开始批量上传');
     log('▶ 开始: '+STATE.queue.length+'个文件, 间隔'+cfg.intervalMinutes+'分, 网络拦截模式', 'info');
 
     for (var i=0; i<STATE.queue.length; i++) {
@@ -1221,6 +1237,7 @@
       STATE.currentIndex = i; updateStats(); updateQueueList();
       var item = STATE.queue[i];
       if (getUploadedSet().has(item.name)) { log('⏭ 跳过: '+item.name, 'info'); continue; }
+      setResumeState('处理中: '+item.name);
       await uploadOneFile(item);
       if (i < STATE.queue.length-1) {
         var wait = Math.max(30000, cfg.intervalMinutes*60000 + (Math.random()-0.5)*60000);
@@ -1230,6 +1247,7 @@
       }
     }
     STATE.running = false; STATE.paused = false; STATE.currentIndex = -1;
+    clearResumeState();
     updateButtons(); updateStats(); log('✅ 上传结束', 'success');
   }
 
@@ -1386,7 +1404,7 @@
     panel.id = PANEL_ID;
     panel.innerHTML =
 '<div class="qw-header" id="qw-header-drag">'+
-' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.0.0</span>'+
+' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.1.0</span>'+
 ' <span class="qw-header-spacer"></span>'+
 ' <button class="qw-header-btn" id="qw-btn-minimize" title="最小化">−</button>'+
 '</div>'+
@@ -1445,7 +1463,7 @@
 ' </div>'+
 ' <div class="qw-row" style="gap:4px;margin-top:4px;"><input type="text" id="qw-input-range" style="flex:1;background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:4px 8px;font-size:11px;" placeholder="按序号: 1,3,5-10"><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-upload-range">上传指定</button></div>'+
 ' <hr class="qw-divider">'+
-' <div class="qw-section"><div class="qw-section-title">📜 日志</div><div class="qw-log-container" id="qw-log-container"><div class="qw-log-entry qw-log-info">🚀 Pro v4.0.0 已启动</div><div class="qw-log-entry qw-log-info">📌 选择文件夹或拖拽PDF开始</div></div></div>'+
+' <div class="qw-section"><div class="qw-section-title">📜 日志</div><div class="qw-log-container" id="qw-log-container"><div class="qw-log-entry qw-log-info">🚀 Pro v4.1.0 已启动</div><div class="qw-log-entry qw-log-info">📌 选择文件夹或拖拽PDF开始</div></div></div>'+
 '</div>';
     document.body.appendChild(panel);
 
@@ -1506,7 +1524,7 @@
       await runUploadLoop();
     });
     ui.btnPause.addEventListener('click', function(){ if(!STATE.running)return; STATE.paused=!STATE.paused; ui.btnPause.textContent=STATE.paused?'▶ 继续':'⏸ 暂停'; log(STATE.paused?'⏸ 已暂停':'▶ 已恢复','warn'); });
-    ui.btnStop.addEventListener('click', function(){ STATE.running=false; STATE.paused=false; stopCollecting(); updateButtons(); log('⏹ 已停止','warn'); });
+    ui.btnStop.addEventListener('click', function(){ STATE.running=false; STATE.paused=false; stopCollecting(); clearResumeState(); updateButtons(); log('⏹ 已停止','warn'); });
     ui.btnReset.addEventListener('click', function(){ if(confirm('清除上传记录？')){ clearUploaded(); updateStats(); updateQueueList(); log('🔄 已重置','warn'); } });
     ui.btnMinimize.addEventListener('click', function(){ STATE.ui.panel.classList.toggle('qw-collapsed'); });
 
@@ -1685,7 +1703,7 @@
     // create panel first so ui exists for logging
     createPanel();
     updateRotateIndex();
-    log('v4.0.0 started','info');log('fetch hijack active','info');
+    log('v4.1.0 started','info');log('fetch hijack active','info');
 
     // restore persisted logs to panel
     if(STATE.logBuffer.length>0&&STATE.ui.logContainer){
@@ -1719,6 +1737,27 @@
     await sleep(3000);
     var ed=findInputBox();
     if(ed)log('input ready','success');else log('no input','warn');
+
+    // v4.1.0: 断点自动恢复 — 上次运行被页面跳转/刷新中断时自动续传
+    window.addEventListener('beforeunload', function(){ if(STATE.running) setResumeState('页面卸载'); });
+    var resume = getResumeState();
+    if (resume) {
+      clearResumeState();
+      if (STATE.queue.length > 0) {
+        var upSet = getUploadedSet(), remaining = 0;
+        for (var qi=0; qi<STATE.queue.length; qi++) { if (!upSet.has(STATE.queue[qi].name)) remaining++; }
+        if (remaining > 0) {
+          log('🔁 检测到运行中断('+(resume.reason||'页面刷新')+')，8秒后自动恢复上传(剩余'+remaining+'个)。不需要恢复请点 ⏹ 停止', 'warn');
+          persistLog('自动恢复: '+(resume.reason||'页面刷新')+'，剩余 '+remaining+' 个', 'warn');
+          STATE.ui.btnStop.disabled = false;
+          setTimeout(function(){ if(!STATE.running && STATE.queue.length>0) runUploadLoop(); }, 8000);
+        } else {
+          log('🔁 检测到中断标记，但队列已全部完成', 'info');
+        }
+      } else {
+        log('⚠️ 检测到运行中断，但队列为空(文件夹权限可能失效)，请重新选择文件夹后点开始', 'warn');
+      }
+    }
   }
 
   // @run-at document-start → 需要等 DOM ready

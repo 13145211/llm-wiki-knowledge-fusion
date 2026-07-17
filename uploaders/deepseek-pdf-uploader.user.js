@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DeepSeek PDF 批量上传器
 // @namespace    https://github.com/qclaw/deepseek-pdf-uploader
-// @version      1.0.0
-// @description  DeepSeek 网页版 PDF 批量上传 + Prompt 轮换 + 自动保存 + 断点续传 + 时间窗口
+// @version      1.1.0
+// @description  DeepSeek 网页版 PDF 批量上传 + 断点自动恢复 + Prompt 轮换 + 自动保存 + 时间窗口
 // @author       QClaw (adapted from Doubao version)
 // @match        https://chat.deepseek.com/*
 // @grant        GM_setValue
@@ -438,6 +438,26 @@ Post-completion Audit:
 
     function getUploadRecords() {
         return gmGet('uploadRecords', []);
+    }
+
+    // ==================== 断点自动恢复（v1.1.0） ====================
+    // 根因：startNewChat() 兜底用 Logo 点击 / window.location.href 跳转，整页刷新
+    // 会杀死脚本运行环境，导致批量任务中断、只能手动重新开始。
+    // 方案：运行期间持久化"运行中"标记；页面重载后 init() 检测到标记即自动续传
+    //（已完成文件自动跳过）。标记超过 30 分钟视为过期，避免隔天打开页面突然自启。
+    const RESUME_MAX_AGE_MS = 30 * 60 * 1000;
+
+    function setResumeState(reason) {
+        gmSet('resumeState', { active: true, savedAt: Date.now(), reason: reason || '' });
+    }
+    function clearResumeState() {
+        gmSet('resumeState', null);
+    }
+    function getResumeState() {
+        const st = gmGet('resumeState', null);
+        if (!st || !st.active) return null;
+        if (Date.now() - (st.savedAt || 0) > RESUME_MAX_AGE_MS) return null;
+        return st;
     }
 
     // ==================== 持久化日志系统 ====================
@@ -1513,6 +1533,7 @@ Post-completion Audit:
         for (const link of logoLinks) {
             if (isInsideOurPanel(link)) continue;
             log('🔄 点击 Logo 导航到首页', 'warn');
+            if (STATE.running) setResumeState('新建对话-Logo导航');
             link.click();
             await sleep(5000);
             return true;
@@ -1520,6 +1541,7 @@ Post-completion Audit:
 
         // 策略4: 直接导航
         log('🔄 URL 导航到 DeepSeek 首页', 'warn');
+        if (STATE.running) setResumeState('新建对话-跳转首页');
         window.location.href = 'https://chat.deepseek.com/';
         await sleep(8000);
         return true;
@@ -1759,6 +1781,7 @@ Post-completion Audit:
         STATE.paused = false;
         STATE.consecutiveFailures = 0;
         updateButtons();
+        setResumeState('开始批量上传');
 
         if (config.scheduleStart && config.scheduleEnd) {
             if (isWithinSchedule(config)) {
@@ -1818,6 +1841,7 @@ Post-completion Audit:
                 continue;
             }
 
+            setResumeState('处理中: ' + item.name);
             const success = await uploadOneFile(item);
 
             if (i < STATE.queue.length - 1 && STATE.running) {
@@ -1839,6 +1863,7 @@ Post-completion Audit:
         STATE.currentIndex = -1;
         updateButtons();
         updateStats();
+        clearResumeState();
 
         const allDone = STATE.queue.every(item => getUploadedSet().has(item.name));
         if (allDone) {
@@ -2102,7 +2127,7 @@ Post-completion Audit:
         panel.innerHTML = `
             <div class="ds-header" id="ds-header-drag">
                 <span class="ds-header-icon">🐋</span>
-                <span class="ds-header-text">DeepSeek PDF 批量上传器 v1.0.0</span>
+                <span class="ds-header-text">DeepSeek PDF 批量上传器 v1.1.0</span>
                 <span class="ds-header-spacer"></span>
                 <span class="ds-minimize-icon" id="ds-minimize-icon" title="展开">🐋</span>
                 <button class="ds-header-btn" id="ds-btn-minimize" title="最小化">−</button>
@@ -2263,7 +2288,7 @@ Post-completion Audit:
                 <div class="ds-section">
                     <div class="ds-section-title">📜 日志</div>
                     <div class="ds-log-container" id="ds-log-container">
-                        <div class="ds-log-entry ds-log-info">🐋 DeepSeek PDF 批量上传器 v1.0.0 已启动</div>
+                        <div class="ds-log-entry ds-log-info">🐋 DeepSeek PDF 批量上传器 v1.1.0 已启动</div>
                         <div class="ds-log-entry ds-log-info">📌 选择文件夹或拖拽PDF到页面开始</div>
                         <div class="ds-log-entry ds-log-info">💡 首次使用建议先手动上传一个PDF确认流程正常</div>
                     </div>
@@ -2459,6 +2484,7 @@ Post-completion Audit:
         ui.btnStop.addEventListener('click', () => {
             STATE.running = false;
             STATE.paused = false;
+            clearResumeState();
             updateButtons();
             log('⏹ 已停止上传', 'warn');
         });
@@ -2909,7 +2935,7 @@ Post-completion Audit:
     async function init() {
         loadPersistedLog();
 
-        log('🐋 DeepSeek PDF 批量上传器 v1.0.0 已启动', 'info');
+        log('🐋 DeepSeek PDF 批量上传器 v1.1.0 已启动', 'info');
 
         createPanel();
 
@@ -3010,6 +3036,30 @@ Post-completion Audit:
         if (STATE.totalUploaded > 0) {
             log(`📊 发现 ${STATE.totalUploaded} 条历史上传记录（断点续传就绪）`, 'info');
         }
+        // v1.1.0: 断点自动恢复 — 上次运行被页面跳转/刷新中断时自动续传
+        window.addEventListener('beforeunload', () => {
+            if (STATE.running) setResumeState('页面卸载');
+        });
+        const resume = getResumeState();
+        if (resume) {
+            clearResumeState();
+            if (STATE.queue.length > 0) {
+                const remaining = STATE.queue.filter(it => !getUploadedSet().has(it.name)).length;
+                if (remaining > 0) {
+                    log(`🔁 检测到运行中断（${resume.reason || '页面刷新'}），8 秒后自动恢复上传（剩余 ${remaining} 个）。不需要恢复请点 ⏹ 停止`, 'warn');
+                    persistLog(`自动恢复: ${resume.reason || '页面刷新'}，剩余 ${remaining} 个`, 'warn');
+                    STATE.ui.btnStop.disabled = false;
+                    setTimeout(() => {
+                        if (!STATE.running && STATE.queue.length > 0) runUploadLoop();
+                    }, 8000);
+                } else {
+                    log('🔁 检测到中断标记，但队列已全部完成，无需恢复', 'info');
+                }
+            } else {
+                log('⚠️ 检测到运行中断，但队列为空（文件夹权限可能失效），请重新选择文件夹后点 ▶ 开始', 'warn');
+            }
+        }
+
         log('✅ 初始化完成，等待操作', 'info');
         log('💡 提示: 如果上传按钮未自动找到，请手动点击 DeepSeek 的附件按钮一次', 'info');
     }

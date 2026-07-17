@@ -5,8 +5,8 @@
 | 脚本文件 | 平台 | 版本 | 平台特色 |
 |------|------|------|------|
 | [`doubao-pdf-uploader-pro.user.js`](doubao-pdf-uploader-pro.user.js) | [豆包](https://www.doubao.com) | 4.5.0 | SSE 流拦截 + MutationObserver 加速完成判定、可用平台默认总结按钮 |
-| [`qianwen-pdf-uploader-pro.user.js`](qianwen-pdf-uploader-pro.user.js) | [千问](https://www.qianwen.com) | 4.0.0 | `showOpenFilePicker` 劫持注入文件、网络拦截 + DOM 双通道取回答 |
-| [`deepseek-pdf-uploader.user.js`](deepseek-pdf-uploader.user.js) | [DeepSeek](https://chat.deepseek.com) | 1.0.0 | 自适应 DOM 探测、深度思考模式开关、思考链内容排除 |
+| [`qianwen-pdf-uploader-pro.user.js`](qianwen-pdf-uploader-pro.user.js) | [千问](https://www.qianwen.com) | 4.1.0 | `showOpenFilePicker` 劫持注入文件、网络拦截 + DOM 双通道取回答 |
+| [`deepseek-pdf-uploader.user.js`](deepseek-pdf-uploader.user.js) | [DeepSeek](https://chat.deepseek.com) | 1.1.0 | 自适应 DOM 探测、深度思考模式开关、思考链内容排除 |
 
 ## 安装（3 步）
 
