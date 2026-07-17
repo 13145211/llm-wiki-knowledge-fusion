@@ -1,8 +1,8 @@
 ﻿// ==UserScript==
 // @name         豆包 PDF 批量上传器 Pro
 // @namespace    https://github.com/qclaw/doubao-pdf-uploader
-// @version      4.4.0
-// @description  v4.4.0 文件名前缀+时间窗口 | 豆包按钮 | Prompt轮换 | 回答验证 | 持久化日志
+// @version      4.5.0
+// @description  v4.5.0 断点自动恢复(页面跳转后自动续传) | 文件名前缀+时间窗口 | Prompt轮换 | 回答验证 | 持久化日志
 // @author       QClaw
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -450,6 +450,26 @@ Post-completion Audit:
 
     function getUploadRecords() {
         return gmGet('uploadRecords', []);
+    }
+
+    // ==================== 断点自动恢复（v4.5.0） ====================
+    // 根因：startNewChat() 兜底用 window.location.href 跳转，整页刷新会杀死脚本
+    // 运行环境，导致批量任务中断、只能手动重新开始。
+    // 方案：运行期间持久化"运行中"标记；页面重载后 init() 检测到标记即自动续传
+    //（已完成文件自动跳过）。标记超过 30 分钟视为过期，避免隔天打开页面突然自启。
+    const RESUME_MAX_AGE_MS = 30 * 60 * 1000;
+
+    function setResumeState(reason) {
+        gmSet('resumeState', { active: true, savedAt: Date.now(), reason: reason || '' });
+    }
+    function clearResumeState() {
+        gmSet('resumeState', null);
+    }
+    function getResumeState() {
+        const st = gmGet('resumeState', null);
+        if (!st || !st.active) return null;
+        if (Date.now() - (st.savedAt || 0) > RESUME_MAX_AGE_MS) return null;
+        return st;
     }
 
     // ==================== 持久化日志系统 ====================
@@ -1524,6 +1544,7 @@ Post-completion Audit:
         const url = window.location.href;
         const baseUrl = url.replace(/\/chat\/[^/?]+/, '/chat');
         if (baseUrl !== url) {
+            if (STATE.running) setResumeState('新建对话-URL跳转');
             window.location.href = baseUrl;
             await sleep(8000);
             return true;
@@ -1531,6 +1552,7 @@ Post-completion Audit:
 
         // 策略4: 导航到首页
         log('🔄 导航到豆包首页', 'warn');
+        if (STATE.running) setResumeState('新建对话-跳转首页');
         window.location.href = 'https://www.doubao.com/chat';
         await sleep(8000);
         return true;
@@ -1784,6 +1806,7 @@ Post-completion Audit:
         STATE.paused = false;
         STATE.consecutiveFailures = 0;
         updateButtons();
+        setResumeState('开始批量上传');
 
         // v4.4.0: 时间窗口提示
         if (config.scheduleStart && config.scheduleEnd) {
@@ -1845,6 +1868,7 @@ Post-completion Audit:
                 continue;
             }
 
+            setResumeState('处理中: ' + item.name);
             const success = await uploadOneFile(item);
 
             if (i < STATE.queue.length - 1 && STATE.running) {
@@ -1866,6 +1890,7 @@ Post-completion Audit:
         STATE.currentIndex = -1;
         updateButtons();
         updateStats();
+        clearResumeState();
 
         const allDone = STATE.queue.every(item => getUploadedSet().has(item.name));
         if (allDone) {
@@ -2139,7 +2164,7 @@ Post-completion Audit:
         panel.innerHTML = `
             <div class="db-header" id="db-header-drag">
                 <span class="db-header-icon">📁</span>
-                <span class="db-header-text">豆包 PDF 批量上传器 v4.4.0</span>
+                <span class="db-header-text">豆包 PDF 批量上传器 v4.5.0</span>
                 <span class="db-header-spacer"></span>
                 <span class="db-minimize-icon" id="db-minimize-icon" title="展开">📁</span>
                 <button class="db-header-btn" id="db-btn-minimize" title="最小化">−</button>
@@ -2294,7 +2319,7 @@ Post-completion Audit:
                 <div class="db-section">
                     <div class="db-section-title">📜 日志</div>
                     <div class="db-log-container" id="db-log-container">
-                        <div class="db-log-entry db-log-info">🚀 豆包 PDF 批量上传器 v4.1.1 已启动</div>
+                        <div class="db-log-entry db-log-info">🚀 豆包 PDF 批量上传器 v4.5.0 已启动</div>
                         <div class="db-log-entry db-log-info">📌 选择文件夹或拖拽PDF到页面开始</div>
                     </div>
                 </div>
@@ -2512,6 +2537,7 @@ Post-completion Audit:
 
         ui.btnStop.addEventListener('click', () => {
             STATE.running = false; STATE.paused = false;
+            clearResumeState();
             updateButtons(); log('⏹ 已停止上传', 'warn');
         });
 
@@ -2988,7 +3014,7 @@ Post-completion Audit:
     async function init() {
         loadPersistedLog();
 
-        log('🚀 豆包 PDF 批量上传器 v4.1.1 已启动', 'info');
+        log('🚀 豆包 PDF 批量上传器 v4.5.0 已启动', 'info');
 
         createPanel();
 
@@ -3084,6 +3110,30 @@ Post-completion Audit:
 
         if (uploaded.size > 0) {
             log(`📊 发现 ${uploaded.size} 条历史上传记录（断点续传就绪）`, 'info');
+        }
+
+        // v4.5.0: 断点自动恢复 — 上次运行被页面跳转/刷新中断时自动续传
+        window.addEventListener('beforeunload', () => {
+            if (STATE.running) setResumeState('页面卸载');
+        });
+        const resume = getResumeState();
+        if (resume) {
+            clearResumeState();
+            if (STATE.queue.length > 0) {
+                const remaining = STATE.queue.filter(it => !getUploadedSet().has(it.name)).length;
+                if (remaining > 0) {
+                    log(`🔁 检测到运行中断（${resume.reason || '页面刷新'}），8 秒后自动恢复上传（剩余 ${remaining} 个）。不需要恢复请点 ⏹ 停止`, 'warn');
+                    persistLog(`自动恢复: ${resume.reason || '页面刷新'}，剩余 ${remaining} 个`, 'warn');
+                    STATE.ui.btnStop.disabled = false;
+                    setTimeout(() => {
+                        if (!STATE.running && STATE.queue.length > 0) runUploadLoop();
+                    }, 8000);
+                } else {
+                    log('🔁 检测到中断标记，但队列已全部完成，无需恢复', 'info');
+                }
+            } else {
+                log('⚠️ 检测到运行中断，但队列为空（文件夹权限可能失效），请重新选择文件夹后点 ▶ 开始', 'warn');
+            }
         }
 
         log('✅ 初始化完成，等待操作', 'info');

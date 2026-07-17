@@ -35,7 +35,7 @@ L2 GBrain 图谱索引（实体摘要 + Wiki 链接）
 
 | 脚本文件 | 平台 | 版本 | 技术特色 |
 |------|------|------|------|
-| [`doubao-pdf-uploader-pro.user.js`](uploaders/doubao-pdf-uploader-pro.user.js) | [豆包](https://www.doubao.com) | 4.4.0 | SSE 流拦截 + MutationObserver 加速完成判定、平台默认总结按钮模式 |
+| [`doubao-pdf-uploader-pro.user.js`](uploaders/doubao-pdf-uploader-pro.user.js) | [豆包](https://www.doubao.com) | 4.5.0 | SSE 流拦截 + MutationObserver 加速完成判定、平台默认总结按钮模式 |
 | [`qianwen-pdf-uploader-pro.user.js`](uploaders/qianwen-pdf-uploader-pro.user.js) | [千问](https://www.qianwen.com) | 4.0.0 | `showOpenFilePicker` 劫持注入文件、网络拦截 + DOM 双通道取回答 |
 | [`deepseek-pdf-uploader.user.js`](uploaders/deepseek-pdf-uploader.user.js) | [DeepSeek](https://chat.deepseek.com) | 1.0.0 | 自适应 DOM 探测、深度思考模式开关、思考链内容排除 |
 

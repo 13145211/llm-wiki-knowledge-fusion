@@ -15,7 +15,7 @@
 
 | 脚本 | 平台 | 版本 |
 |------|------|------|
-| `doubao-pdf-uploader-pro.user.js` | 豆包 | 4.4.0 |
+| `doubao-pdf-uploader-pro.user.js` | 豆包 | 4.5.0 |
 | `qianwen-pdf-uploader-pro.user.js` | 千问 | 4.0.0 |
 | `deepseek-pdf-uploader.user.js` | DeepSeek | 1.0.0 |
 
