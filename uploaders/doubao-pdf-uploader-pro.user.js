@@ -1151,9 +1151,32 @@
 
     function getChatMessageElements(container) {
         if (!container) return [];
-        const rows = container.querySelectorAll('div.v_list_row, div[class*="v_list_row"]');
-        if (rows.length > 0) return [...rows].filter(el => !isInsideOurPanel(el));
-        return [...container.children].filter(el => !isInsideOurPanel(el));
+        return [...container.children].filter(el => {
+            if (isInsideOurPanel(el)) return false;
+            // v4.5.2: 只取 assistant 消息，跳过用户消息
+            return isAssistantEl(el);
+        });
+    }
+
+    // 豆包/v_list_row 没有 role 属性，用 class/布局位置区分
+    function isAssistantEl(el) {
+        // 遍历祖先找是否为 assistant conversation turn
+        var cur = el;
+        while (cur) {
+            var cls = (cur.className || '').toString ? (cur.className || '').toString() : '';
+            if (/agent|assistant|(?:^|_)reply(?:$|_)|reply/i.test(cls)) return true;
+            // data 属性
+            var role = cur.getAttribute ? cur.getAttribute('data-role') || cur.getAttribute('role') : '';
+            if (/assistant/i.test(role)) return true;
+            cur = cur.parentElement;
+        }
+        // 最后一层兜底：layout 包含发送者图标（豆包 assistant 有头像）+ md 块
+        var icons = el.querySelectorAll('.user-icon, .agent-icon, img[alt="assistant"], [class*="avatar"][class*="bot"]');
+        if (icons.length > 0) return true;
+        // 如果某个 v_list_row 内部有 md-box（AI 回答特征），推定是 assistant
+        var mdBox = el.querySelector('.md-box-root, [class*="md-box"], [class*="markdown"]');
+        if (mdBox && !el.querySelector('.semi-input-textarea, [contenteditable]')) return true;
+        return false;
     }
 
     function hashText(text) {

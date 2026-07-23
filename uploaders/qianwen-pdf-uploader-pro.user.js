@@ -779,60 +779,69 @@
     };
   }
 
-  // DOM 通道：获取新增回答
+  // DOM 通道：获取新增回答 — v4.1.2 改为按 DOM 角色选择，不靠文本过滤
   function getNewAnswerText(snapshot) {
-    var rounds = document.querySelectorAll(
+    // 千问 assistant 回合有两种常见容器：.qk-chat-agent / [class*="agent"] / data-role="assistant"
+    var allRounds = document.querySelectorAll(
       '[class*="chat-round"], [class*="ChatRound"], ' +
       '[class*="message-item"], [class*="MessageItem"], ' +
       '[class*="conversation-turn"], [class*="ConversationTurn"]'
     );
-
-    var newRounds = [];
-    if (rounds.length > snapshot.rounds && snapshot.lastRound) {
+    // 只取新增的、标记为 assistant 的回合
+    var newAssistantRounds = [];
+    if (allRounds.length > snapshot.rounds && snapshot.lastRound) {
       var startIdx = -1;
-      for (var i = 0; i < rounds.length; i++) {
-        if (rounds[i] === snapshot.lastRound) { startIdx = i+1; break; }
+      for (var i = 0; i < allRounds.length; i++) {
+        if (allRounds[i] === snapshot.lastRound) { startIdx = i + 1; break; }
       }
       if (startIdx < 0) startIdx = snapshot.rounds;
-      for (var j = startIdx; j < rounds.length; j++) {
-        if (!inside(rounds[j])) newRounds.push(rounds[j]);
+      for (var j = startIdx; j < allRounds.length; j++) {
+        if (inside(allRounds[j])) continue;
+        // ★ 只要 assistant 回合，跳过用户自己的回合
+        if (isAssistantContainer(allRounds[j])) newAssistantRounds.push(allRounds[j]);
       }
     }
-
+    // 优先从新增 assistant 回合取文本
     var best = '';
-    for (var k = 0; k < newRounds.length; k++) {
-      var md = newRounds[k].querySelector('.qk-markdown, .qk-markdown-react, [class*="markdown"]');
-      if (md && !inside(md)) { var t = (md.textContent||'').trim(); if (t.length > best.length && !isPrompt(t)) best = t; }
-      if (best.length < 50) { var t2 = (newRounds[k].textContent||'').trim(); if (t2.length > best.length && !isPrompt(t2)) best = t2; }
+    for (var k = 0; k < newAssistantRounds.length; k++) {
+      var md = newAssistantRounds[k].querySelector('.qk-markdown, .qk-markdown-react, [class*="markdown"]');
+      if (md && !inside(md)) {
+        var txt = (md.textContent || '').trim();
+        if (txt.length > best.length && txt.length > 100) best = txt;
+      }
+      if (best.length < 100) {
+        var txt2 = (newAssistantRounds[k].textContent || '').trim();
+        if (txt2.length > best.length && txt2.length > 200) best = txt2;
+      }
     }
-
-    var mdBlocks = document.querySelectorAll('.qk-markdown, .qk-markdown-react, [class*="markdown-content"]');
-    if (best.length < 100 && mdBlocks.length > snapshot.markdowns) {
+    // 兜底：全局 .qk-markdown 但只取 assistant 容器内的
+    if (best.length < 100) {
+      var mdBlocks = document.querySelectorAll('.qk-markdown, .qk-markdown-react, [class*="markdown-content"]');
       for (var m = snapshot.markdowns; m < mdBlocks.length; m++) {
         if (inside(mdBlocks[m])) continue;
-        var t3 = (mdBlocks[m].textContent||'').trim();
-        if (t3.length > best.length && !isPrompt(t3)) best = t3;
-      }
-    }
-
-    if (best.length < 200) {
-      var mains = document.querySelectorAll('main');
-      for (var n = mains.length-1; n >= 0; n--) {
-        if (inside(mains[n])) continue;
-        var divs = mains[n].querySelectorAll('div');
-        for (var p = divs.length-1; p >= 0; p--) {
-          if (inside(divs[p])) continue;
-          var t4 = (divs[p].textContent||'').trim();
-          if (t4.length < 300) continue;
-          if (isPrompt(t4)) continue;
-          if (t4.indexOf('新建对话')>=0 && t4.indexOf('智能体')>=0) continue;
-          if (t4.indexOf('API 服务')>=0 && t4.length<500) continue;
-          if (t4.length > best.length) best = t4;
-        }
+        if (!isInsideAssistant(mdBlocks[m])) continue;
+        var txt3 = (mdBlocks[m].textContent || '').trim();
+        if (txt3.length > best.length && txt3.length > 200) best = txt3;
       }
     }
     return best;
   }
+
+  // ★ 判断一个 DOM 元素是否在 assistant 回合内（而非用户回合 / 侧边栏）
+  function isInsideAssistant(el) {
+    // 千问 assistant 回合特征：class 含 agent / assistant，或 data-role="assistant"
+    if (!el) return false;
+    var cur = el;
+    while (cur) {
+      var cls = (cur.className || '').toString ? (cur.className || '').toString() : '';
+      if (/agent|assistant/i.test(cls)) return true;
+      var role = cur.getAttribute ? cur.getAttribute('data-role') || cur.getAttribute('role') : '';
+      if (/assistant/i.test(role)) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+  function isAssistantContainer(el) { return isInsideAssistant(el); }
 
   function isPrompt(text) {
     if (!text) return false;

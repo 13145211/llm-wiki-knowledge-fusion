@@ -1152,7 +1152,27 @@
 
     function getChatMessageElements(container) {
         if (!container) return [];
-        return [...container.children].filter(el => !isInsideOurPanel(el));
+        // v1.1.2: 只取 assistant 消息，跳过用户消息
+        return [...container.children].filter(el => {
+            if (isInsideOurPanel(el)) return false;
+            return isAssistantEl(el);
+        });
+    }
+
+    // DeepSeek assistant 回合特征：class 含 'ds-chat-agent' / data-role="assistant"
+    function isAssistantEl(el) {
+        var cur = el;
+        while (cur) {
+            var cls = (cur.className || '').toString ? (cur.className || '').toString() : '';
+            if (/agent|assistant|(?:^|_)reply(?:$|_)/i.test(cls)) return true;
+            var role = cur.getAttribute ? cur.getAttribute('data-role') || cur.getAttribute('role') : '';
+            if (/assistant/i.test(role)) return true;
+            cur = cur.parentElement;
+        }
+        // 兜底：有 ds-markdown 块且没有 input 元素的推定是 assistant
+        var md = el.querySelector('.ds-markdown, [class*="markdown"]');
+        if (md && !el.querySelector('textarea, [contenteditable="true"], [role="textbox"]')) return true;
+        return false;
     }
 
     function hashText(text) {
