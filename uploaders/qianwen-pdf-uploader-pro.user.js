@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         千问 PDF 批量上传器 Pro
 // @namespace    https://github.com/qclaw/qianwen-pdf-uploader
-// @version      4.1.1
-// @description  v4.1.1: 断点自动恢复|通用七段法Prompt(默认固定)|回答验证|日志|时间窗口|重试
+// @version      4.3.0
+// @description  v4.3.0: 纯DOM通道|input.click+showPicker劫持|无网络拦截|修复文件注入
 // @author       QClaw
 // @match        https://www.qianwen.com/*
 // @match        https://qianwen.com/*
@@ -19,33 +19,32 @@
 (function() {
   'use strict';
 
-  // ==================== 内部常量（一般无需修改） ====================
-  var STORE_PREFIX = 'qwpdf_';             // 油猴存储键前缀
-  var PANEL_ID = 'qw-uploader-panel';      // 控制面板元素 ID
-  var DROP_OVERLAY_ID = 'qw-drop-overlay'; // 拖拽遮罩元素 ID
+  // ==================== 常量 ====================
+  var STORE_PREFIX = 'qwpdf_';
+  var PANEL_ID = 'qw-uploader-panel';
+  var DROP_OVERLAY_ID = 'qw-drop-overlay';
 
-  // ==================== 用户可调配置（默认值，均可在面板中修改） ====================
   var DEFAULT_CONFIG = {
-    folderDisplayName: '',            // 上次所选文件夹名（自动记忆，无需手改）
-    intervalMinutes: 10,              // 上传间隔（分钟）：两篇文献之间的等待时间
-    fileParseWaitSeconds: 10,         // 文件解析等待（秒）：上传后等平台解析 PDF
-    sendDelaySeconds: 2,              // 发送延迟（秒）：Prompt 输入完成到发送
-    responseTimeoutMinutes: 25,       // 回答超时（分钟）：超过则放弃本篇
-    responseStableSeconds: 10,        // 稳定判定（秒）：回答 N 秒无变化视为生成完毕
-    responseMinWaitSeconds: 20,       // 最短等待（秒）：至少等这么久才判定完成
-    autoClearAfterComplete: false,    // 全部完成后自动清空上传记录
-    autoPrompt: true,                 // 上传后自动输入精读 Prompt
-    promptText: '',                   // 自定义 Prompt（留空 = 使用内置通用文献七段法模板）
-    autoSave: true,                   // 自动把回答下载为 .md（浏览器默认下载目录）
-    cooldownMinutes: 120,             // 冷却时间（分钟）：无效回答后暂停
-    wakeupPrompt: 'hello',            // 唤醒问题：冷却结束后先发一句日常对话
-    uploadWaitSeconds: 5,             // 上传后等待（秒）
-    promptDoneWaitSeconds: 2,         // Prompt 后等待（秒）
-    presendWaitSeconds: 3,            // 发送前等待（秒）
-    activePromptTab: 0,               // 当前激活的 Prompt 变体编号
-    autoRotateEnabled: false,          // 每篇自动轮换 Prompt 变体
-    scheduleStart: '',                // 时间窗口开始（如 '08:00'，留空不限）
-    scheduleEnd: ''                   // 时间窗口结束（如 '22:00'，留空不限）
+    folderDisplayName: '',
+    intervalMinutes: 10,
+    fileParseWaitSeconds: 10,
+    sendDelaySeconds: 2,
+    responseTimeoutMinutes: 25,
+    responseStableSeconds: 10,
+    responseMinWaitSeconds: 20,
+    autoClearAfterComplete: false,
+    autoPrompt: true,
+    promptText: '',
+    autoSave: true,
+    cooldownMinutes: 120,
+    wakeupPrompt: 'hello',
+    uploadWaitSeconds: 5,
+    promptDoneWaitSeconds: 2,
+    presendWaitSeconds: 3,
+    activePromptTab: 0,
+    autoRotateEnabled: true,
+    scheduleStart: '',
+    scheduleEnd: ''
   };
 
   var STATE = {
@@ -55,15 +54,6 @@
     logBuffer: [], logLoaded: false,
     lastSavedHash: '', processedHashes: [], baselineFingerprints: new Set(),
     prompt_index: 0
-  };
-
-  // 网络拦截器状态
-  var NET = {
-    collecting: false,
-    collectedText: '',
-    lastActivity: 0,
-    targetReqId: '',
-    reqStartTime: 0
   };
 
   var selectedFiles = {};
@@ -76,101 +66,33 @@
   }
   function gmSet(key, value) { GM_setValue(STORE_PREFIX + key, JSON.stringify(value)); }
 
-  // ==================== Prompt（通用文献七段法，2 个角色变体轮换） ====================
   var DEFAULT_PROMPT =
-`## 角色设定
-你是专业严谨的科研助理，逻辑缜密、学术规范，严格依据论文**正文文字+所有实验图表**，撰写标准化7段式文献精读笔记，全程客观中立、有据可依。
-
-## 严格执行准则
-1. 所有内容**完全来源于原文图文**，绝不编造、杜撰任何数据与结论
-2. 文字描述与图表数据冲突时，**以文本为准**，并注明图文数据存在不一致
-3. 主观推导、延伸分析统一标注**合理推断**，文献未提及内容标注**原文未说明**
-4. 所有关键参数、数值均标注来源：Fig.XX / Table.XX
-5. 所有附图、附表均**系统性深度识别解读**，不遗漏结构、趋势、差异、对比规律，不局限单一材料图谱参数
-
----
-### 1. 文献基本信息
-论文标题、第一作者、通讯作者、发表期刊、发表年份、DOI编号、文章核心关键词
-
-### 2. 研究背景与科学问题
-1. 该领域现阶段普遍存在的技术瓶颈、行业痛点与待解决科学难题
-2. 现有研究方案、材料、工艺、方法存在的短板与局限性
-3. 本文研究目的、核心待解决问题、验证假设与整体研究目标
-
-### 3. 实验方法与技术路线
-1. 样品制备、试验流程、分组对照、工艺条件、操作步骤与后处理方式
-2. 全部表征检测手段、测试仪器、实验工况与相关测试参数
-3. 数据分析、模型计算、机理推导、动力学与统计学处理方法
-
-### 4. 结果规律与图表全面解读
-按核心发现逐条撰写：结论规律 + 具体量化数值 + 图表出处
-**通用图表识别体系（全学科通用）**
-- 物相/光谱类图谱：识别特征峰位置、峰形强弱、峰偏移、物相组成、结构变化规律
-- 形貌显微图片：分析颗粒尺寸、形貌特征、分散状态、界面结构、微观形貌差异
-- 性能趋势曲线：读取关键节点数值、变化趋势、最优区间、稳定性、组间对比差异
-- 数据对比表格：逐一核对正文引用数据与表格原始数值是否吻合一致
-
-### 5. 研究创新点与学术价值
-基于摘要、结论客观总结，统一用词：作者探明……、作者验证……、作者得出……
-不擅自使用首次、突破性、开创性等绝对化夸张词汇，仅原文原话可引用
-
-### 6. 研究局限与未来展望
-1. 作者原文自述的研究不足、试验条件限制、体系适用范围短板
-2. 实验设计、数据完整性、机理深度等潜在问题，统一标注**合理推断**
-3. 作者规划后续研究方向、优化思路与拓展应用前景
-
-### 7. 全文高度摘要
-字数≤300字，完整概括研究背景、实验思路、核心规律、关键数据与最终研究结论`;
-
-  var QW_PROMPT_1 =
-`## 角色设定
-你是专业严谨的科研助理，逻辑缜密、学术规范，严格依据论文**正文文字+所有实验图表**，撰写标准化7段式文献精读笔记，全程客观中立、有据可依。
-
-## 严格执行准则
-1. 所有内容**完全来源于原文图文**，绝不编造、杜撰任何数据与结论
-2. 文字描述与图表数据冲突时，**以文本为准**，并注明图文数据存在不一致
-3. 主观推导、延伸分析统一标注**合理推断**，文献未提及内容标注**原文未说明**
-4. 所有关键参数、数值均标注来源：Fig.XX / Table.XX
-5. 所有附图、附表均**系统性深度识别解读**，不遗漏结构、趋势、差异、对比规律，不局限单一材料图谱参数
-
----
-### 1. 文献基本信息
-论文标题、第一作者、通讯作者、发表期刊、发表年份、DOI编号、文章核心关键词
-
-### 2. 研究背景与科学问题
-1. 该领域现阶段普遍存在的技术瓶颈、行业痛点与待解决科学难题
-2. 现有研究方案、材料、工艺、方法存在的短板与局限性
-3. 本文研究目的、核心待解决问题、验证假设与整体研究目标
-
-### 3. 实验方法与技术路线
-1. 样品制备、试验流程、分组对照、工艺条件、操作步骤与后处理方式
-2. 全部表征检测手段、测试仪器、实验工况与相关测试参数
-3. 数据分析、模型计算、机理推导、动力学与统计学处理方法
-
-### 4. 结果规律与图表全面解读
-按核心发现逐条撰写：结论规律 + 具体量化数值 + 图表出处
-**通用图表识别体系（全学科通用）**
-- 物相/光谱类图谱：识别特征峰位置、峰形强弱、峰偏移、物相组成、结构变化规律
-- 形貌显微图片：分析颗粒尺寸、形貌特征、分散状态、界面结构、微观形貌差异
-- 性能趋势曲线：读取关键节点数值、变化趋势、最优区间、稳定性、组间对比差异
-- 数据对比表格：逐一核对正文引用数据与表格原始数值是否吻合一致
-
-### 5. 研究创新点与学术价值
-基于摘要、结论客观总结，统一用词：作者探明……、作者验证……、作者得出……
-不擅自使用首次、突破性、开创性等绝对化夸张词汇，仅原文原话可引用
-
-### 6. 研究局限与未来展望
-1. 作者原文自述的研究不足、试验条件限制、体系适用范围短板
-2. 实验设计、数据完整性、机理深度等潜在问题，统一标注**合理推断**
-3. 作者规划后续研究方向、优化思路与拓展应用前景
-
-### 7. 全文高度摘要
-字数≤300字，完整概括研究背景、实验思路、核心规律、关键数据与最终研究结论`;
+'你是 WGS（水煤气变换反应）催化剂领域的博士后研究员。\n'+
+'你的任务是精读一篇催化文献，撰写 7 段结构化笔记。\n\n'+
+'你必须完全忠实地报告**文献原文和图表中的信息**——不能编造任何数字、结论或引用。\n'+
+'当文本和图像信息冲突时，以图像为准并注明矛盾。\n'+
+'如果需要推断，必须标注"合理推断"或"作者未述"。\n\n'+
+'## 1. 基本信息\n<标题/作者/机构/期刊/年份/DOI/通讯/关键词>\n\n'+
+'## 2. 研究背景与问题\n<含(1)具体科学挑战 (2)已有方案不足 (3)本文目标>\n\n'+
+'## 3. 方法/技术路线\n<制备条件(克数/温度/时间/前驱体) + 表征手段(XRD/TEM/TPR/XPS/...) + 性能测试条件>\n\n'+
+'## 4. 核心结果\n<含具体数字 + 图表引用 + 图像解读。每项结果必须注明依据来源>\n\n'+
+'## 5. 创新点\n<基于作者 abstract + conclusions 改写，用"作者报告/作者通过"+ 标"依据"。\n不得使用原文未出现的"首次/新发现/新路径"等绝对化措辞。>\n\n'+
+'## 6. 局限与展望\n<作者自陈 + 合理推断(标"合理推断"或"作者未述")>\n\n'+
+'## 7. 原始文本摘要\n<≤300 字，覆盖核心发现>\n\n'+
+'当遇到以下类型图表时，必须从图像中读取具体值：\n\n'+
+'【XRD 衍射图】读出各衍射峰 2θ 位置和晶面指数，Scherrer 晶粒尺寸与文本对比\n'+
+'【TEM/HRTEM 照片】估算颗粒尺寸范围(nm)，HRTEM 晶格条纹间距\n'+
+'【H₂-TPR 曲线】各还原峰的峰温和相对面积\n'+
+'【XPS 谱图】核实结合能标注\n'+
+'【活性曲线/Arrhenius/TOF】直接读取关键数据点，验证Eₐ值\n'+
+'【Table 数据】验证文中引用数字与表一致\n\n'+
+'完成 7 段后自检：数字反查 | 创新点clean check | 图表引用完整性 | 引号原话 | 零占位符';
 
   // ==================== 配置 ====================
+
   // PROMPT_POOL and rotation
-  var PROMPT_POOL = [DEFAULT_PROMPT, QW_PROMPT_1];
-  var PROMPT_POOL_ORIG = PROMPT_POOL.slice();
+  var PROMPT_POOL = [DEFAULT_PROMPT];
+  var PROMPT_POOL_ORIG = [DEFAULT_PROMPT];
   function getOriginalPrompt(idx) { return PROMPT_POOL_ORIG[idx] || DEFAULT_PROMPT; }
   function getRotatedPrompt() {
     var cfg = getConfig();
@@ -210,21 +132,6 @@
     STATE.totalUploaded=s.size;
   }
   function getUploadRecords(){return gmGet('uploadRecords',[]);}
-
-  // ==================== 断点自动恢复（v4.1.0） ====================
-  // 根因：startNewChat() 兜底用 window.location.href 跳转，整页刷新会杀死脚本
-  // 运行环境，导致批量任务中断、只能手动重新开始。
-  // 方案：运行期间持久化"运行中"标记；页面重载后 init() 检测到标记即自动续传
-  //（已完成文件自动跳过）。标记超过 30 分钟视为过期，避免隔天打开页面突然自启。
-  var RESUME_MAX_AGE_MS = 30*60*1000;
-  function setResumeState(reason){ gmSet('resumeState', {active:true, savedAt:Date.now(), reason:reason||''}); }
-  function clearResumeState(){ gmSet('resumeState', null); }
-  function getResumeState(){
-    var st = gmGet('resumeState', null);
-    if(!st || !st.active) return null;
-    if(Date.now()-(st.savedAt||0) > RESUME_MAX_AGE_MS) return null;
-    return st;
-  }
   function updateRetryFailedButton(){
     if(!STATE.ui.btnRetryFailed)return;
     var cnt=gmGet('uploadRecords',[]).filter(function(r){return r.status==='invalid'||r.status==='no_response';}).length;
@@ -313,244 +220,6 @@
    *
    * 工作流程：
    * 1. 发送消息前，startCollecting() 激活拦截
-   * 2. 所有 fetch 响应被检查，匹配聊天 API 的响应被收集
-   * 3. 回答完成后，stopCollecting() 返回收集到的文本
-   */
-
-  var _origFetch = window.fetch;
-
-  window.fetch = function(url, opts) {
-    var urlStr = (typeof url === 'string') ? url : (url.url || '');
-    var fetchPromise = _origFetch.call(this, url, opts);
-
-    // ★ 收集期间：记录所有 POST 请求用于调试
-    if (NET.collecting && opts && opts.method === 'POST') {
-      // 调试: 打印所有 POST URL（不管是否匹配）
-      log('🔍 [调试] POST: ' + urlStr.substring(0, 120), 'info');
-
-      var matchesChat = false;
-
-      // 先排除明显非聊天的请求
-      var skipPatterns = ['track.uc.cn', 'analytics', 'telemetry', 'beacon',
-        'collect', 'log', 'metric', 'aplus', 'cnzz', 'pageview',
-        '.png', '.jpg', '.gif', '.svg', '.woff', 'abtest',
-        'fingerprint', 'rum', 'perf', 'trace',
-      ];
-      for (var si = 0; si < skipPatterns.length; si++) {
-        if (urlStr.indexOf(skipPatterns[si]) !== -1) break;
-      }
-      if (si >= skipPatterns.length) {
-        // 没匹配到排除项，尝试匹配聊天
-        var chatKw = ['chat', 'completion', 'qwen', 'assistant', 'send',
-          'generate', 'conversation', 'message', '/api/', '/v1/', '/v2/',
-          'tongyi', 'dashscope', 'aliyun',
-        ];
-        for (var ck = 0; ck < chatKw.length; ck++) {
-          if (urlStr.indexOf(chatKw[ck]) !== -1) { matchesChat = true; break; }
-        }
-        // URL 不匹配但 body 很大也是聊天请求
-        if (!matchesChat && opts.body && typeof opts.body === 'string' && opts.body.length > 200) {
-          matchesChat = true;
-        }
-      }
-
-      if (matchesChat) {
-        var reqId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
-        NET.targetReqId = reqId;
-        NET.reqStartTime = Date.now();
-        NET.lastActivity = Date.now();
-        log('🌐 ★ 拦截聊天API: ' + urlStr.substring(0, 80), 'success');
-
-        fetchPromise.then(function(resp) {
-          if (!NET.collecting || NET.targetReqId !== reqId) return;
-          var ct = resp.headers.get('content-type') || '';
-          log('🔍 [调试] Content-Type: ' + ct.substring(0, 60), 'info');
-          var cloned = resp.clone();
-
-          if (ct.indexOf('text/event-stream') !== -1) {
-            log('🌐 SSE流, 解析中...', 'info');
-            cloned.text().then(function(body) {
-              if (!NET.collecting || NET.targetReqId !== reqId) return;
-              var parsed = parseSSE(body);
-              if (parsed.length > NET.collectedText.length) {
-                NET.collectedText = parsed;
-                NET.lastActivity = Date.now();
-                log('🌐 SSE解析成功: ' + parsed.length + '字符', 'success');
-              } else {
-                log('⚠️ SSE解析为空('+(parsed.length)+'字符)', 'warn');
-              }
-            }).catch(function(e) { log('⚠️ SSE读取出错: '+e.message, 'warn'); });
-          } else if (ct.indexOf('application/json') !== -1) {
-            log('🌐 JSON响应, 解析中...', 'info');
-            cloned.text().then(function(body) {
-              if (!NET.collecting || NET.targetReqId !== reqId) return;
-              var text = extractTextFromJSON(body);
-              if (text.length > NET.collectedText.length) {
-                NET.collectedText = text;
-                NET.lastActivity = Date.now();
-                log('🌐 JSON解析成功: ' + text.length + '字符', 'success');
-              } else {
-                log('⚠️ JSON解析为空('+(text.length)+'字符)', 'warn');
-              }
-            }).catch(function(e) { log('⚠️ JSON读取出错: '+e.message, 'warn'); });
-          } else {
-            log('🌐 其他类型('+ct.substring(0,40)+')...', 'info');
-            cloned.text().then(function(body) {
-              if (!NET.collecting || NET.targetReqId !== reqId) return;
-              var text = extractTextFromBody(body);
-              if (text.length > 50 && text.length > NET.collectedText.length) {
-                NET.collectedText = text;
-                NET.lastActivity = Date.now();
-                log('🌐 文本提取成功: ' + text.length + '字符', 'success');
-              }
-            }).catch(function(e) { log('⚠️ 读取出错: '+e.message, 'warn'); });
-          }
-        }).catch(function(e) { log('⚠️ fetch错误: '+e.message, 'warn'); });
-      }
-    }
-
-    return fetchPromise;
-  };
-
-  /**
-   * 解析 SSE (Server-Sent Events) 响应
-   * 参考 WebAI2API doubao_text.js 的 parseSSEResponse
-   */
-  function parseSSE(body) {
-    if (!body) return '';
-    var lines = body.split('\n');
-    var text = '';
-    var reasoning = '';
-
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i].trim();
-
-      // SSE 格式: data: {...}
-      if (line.indexOf('data:') === 0) {
-        var dataStr = line.substring(5).trim();
-        if (!dataStr || dataStr === '[DONE]') continue;
-
-        try {
-          var data = JSON.parse(dataStr);
-
-          // 提取文本内容（兼容多种SSE格式）
-          // 千问格式1: choices[0].delta.content
-          if (data.choices && data.choices[0]) {
-            var choice = data.choices[0];
-            if (choice.delta && choice.delta.content) text += choice.delta.content;
-            else if (choice.message && choice.message.content) text += choice.message.content;
-            else if (choice.text) text += choice.text;
-
-            // reasoning_content (deepseek 兼容)
-            if (choice.delta && choice.delta.reasoning_content) reasoning += choice.delta.reasoning_content;
-          }
-
-          // 千问格式2: output.text
-          if (data.output && data.output.text) text += data.output.text;
-
-          // 千问格式3: text 字段
-          if (data.text && typeof data.text === 'string') text += data.text;
-
-          // 千问格式4: content 字段
-          if (data.content && typeof data.content === 'string') text += data.content;
-
-          // 千问格式5: msg / message
-          if (data.msg && typeof data.msg === 'string') text += data.msg;
-          if (data.message && typeof data.message === 'string') text += data.message;
-
-          // 豆包格式: CHUNK_DELTA 等
-          if (data.CHUNK_DELTA || data.text_block) {
-            if (data.text) text += data.text;
-          }
-
-        } catch(e) { /* 非 JSON 行，跳过 */ }
-      }
-
-      // 有些 SSE 格式不带 data: 前缀
-      if (line && line.charAt(0) === '{') {
-        try {
-          var d = JSON.parse(line);
-          if (d.choices && d.choices[0]) {
-            var c = d.choices[0];
-            if (c.delta && c.delta.content) text += c.delta.content;
-            else if (c.message && c.message.content) text += c.message.content;
-            else if (c.text) text += c.text;
-          }
-          if (d.text && typeof d.text === 'string') text += d.text;
-          if (d.content && typeof d.content === 'string') text += d.content;
-        } catch(e) {}
-      }
-    }
-
-    // text 优先级 > reasoning
-    return text.length > 0 ? text : reasoning;
-  }
-
-  function extractTextFromJSON(body) {
-    if (!body) return '';
-    try {
-      var data = JSON.parse(body);
-      // 尝试各种已知格式
-      if (data.choices && data.choices[0]) {
-        var c = data.choices[0];
-        if (c.message && c.message.content) return c.message.content;
-        if (c.text) return c.text;
-      }
-      if (data.output && data.output.text) return data.output.text;
-      if (data.text) return data.text;
-      if (data.content) return data.content;
-      if (data.data && data.data.text) return data.data.text;
-      // 返回最长的字符串字段
-      return findLongestString(data);
-    } catch(e) { return ''; }
-  }
-
-  function extractTextFromBody(body) {
-    if (!body || body.length < 50) return '';
-    // 尝试 JSON 解析
-    if (body.charAt(0) === '{') {
-      var t = extractTextFromJSON(body);
-      if (t.length > 50) return t;
-    }
-    // 直接返回（可能是纯文本响应）
-    return body.trim();
-  }
-
-  function findLongestString(obj, depth) {
-    if (depth === undefined) depth = 0;
-    if (depth > 10 || !obj) return '';
-    if (typeof obj === 'string') return obj;
-    var best = '';
-    if (Array.isArray(obj)) {
-      for (var i = 0; i < obj.length; i++) {
-        var s = findLongestString(obj[i], depth + 1);
-        if (s.length > best.length) best = s;
-      }
-    } else if (typeof obj === 'object') {
-      var keys = Object.keys(obj);
-      for (var j = 0; j < keys.length; j++) {
-        var s2 = findLongestString(obj[keys[j]], depth + 1);
-        if (s2.length > best.length) best = s2;
-      }
-    }
-    return best;
-  }
-
-  function startCollecting() {
-    NET.collecting = true;
-    NET.collectedText = '';
-    NET.targetReqId = '';
-    NET.reqStartTime = Date.now();
-    NET.lastActivity = Date.now();
-  }
-
-  function stopCollecting() {
-    NET.collecting = false;
-    var text = NET.collectedText;
-    NET.collectedText = '';
-    NET.targetReqId = '';
-    return text;
-  }
 
   // ==================== 千问 DOM 查找 ====================
 
@@ -641,54 +310,82 @@
     return input.files.length > 0;
   }
 
-  // ★ v3.0.2: 单次注入 + 防重复标志
-  var _pwPendingFile = null;        // 待注入的文件
-  var _pwInjected = false;          // 防止重复注入
-  var _pwInjectionDone = null;      // resolve Promise when injection completes
-
-  // 仅劫持 window.showOpenFilePicker（千问实际使用的 API）
-  // 不再劫持 showPicker/click，避免多次触发导致重复文件
+  // ★ v4.3.0: 三通道劫持 — showOpenFilePicker + input.click + input.showPicker
+  var _pwPendingFile = null;
+  var _pwInjected = false;
   var _origSOFP = null;
+  var _origInputClick = null;
+  var _origShowPicker = null;
+
+  function _doInject(f) {
+    try {
+      var inp = findFileInput();
+      if (inp && setFileToInput(inp, f)) { _pwPendingFile = null; return true; }
+      var all = document.querySelectorAll('input[type="file"]');
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].files && all[i].files.length > 0) continue;
+        if (setFileToInput(all[i], f)) { _pwPendingFile = null; return true; }
+      }
+      // 兜底: 创建临时 input
+      var tmp = document.createElement('input');
+      tmp.type = 'file'; tmp.multiple = true;
+      if (setFileToInput(tmp, f)) {
+        document.body.appendChild(tmp);
+        tmp.style.display = 'none';
+        tmp.dispatchEvent(new Event('change', { bubbles: true }));
+        setTimeout(function() { document.body.removeChild(tmp); }, 5000);
+        _pwPendingFile = null; return true;
+      }
+    } catch(e) { log('inject error: '+e.message, 'error'); }
+    return false;
+  }
 
   function patchFileInputHooks(fileObj) {
     _pwPendingFile = fileObj;
     _pwInjected = false;
-    _pwInjectionDone = null;
 
-    if (!_origSOFP && window.showOpenFilePicker) {
-      _origSOFP = window.showOpenFilePicker;
-    }
-    if (window.showOpenFilePicker) {
-      window.showOpenFilePicker = function(opts) {
-        if (_pwPendingFile && !_pwInjected) {
+    if (!_origSOFP) _origSOFP = window.showOpenFilePicker;
+    window.showOpenFilePicker = function(opts) {
+      if (_pwPendingFile && !_pwInjected) {
+        _pwInjected = true; var f = _pwPendingFile;
+        log('intercept showOpenFilePicker, injecting', 'info');
+        return new Promise(function(r) {
+          setTimeout(function() { _doInject(f); r([{ name: f.name, kind: 'file', getFile: function() { return Promise.resolve(f); } }]); }, 200);
+        });
+      }
+      if (_origSOFP) return _origSOFP.call(window, opts);
+      return Promise.reject(new Error('AbortError'));
+    };
+
+    if (!_origInputClick) _origInputClick = HTMLInputElement.prototype.click;
+    HTMLInputElement.prototype.click = function() {
+      if (this.type === 'file' && _pwPendingFile && !_pwInjected) {
+        _pwInjected = true;
+        log('intercept input.click(type=file), injecting', 'info');
+        _doInject(_pwPendingFile);
+        return;
+      }
+      return _origInputClick.apply(this, arguments);
+    };
+
+    if (HTMLInputElement.prototype.showPicker) {
+      if (!_origShowPicker) _origShowPicker = HTMLInputElement.prototype.showPicker;
+      HTMLInputElement.prototype.showPicker = function() {
+        if (this.type === 'file' && _pwPendingFile && !_pwInjected) {
           _pwInjected = true;
-          var f = _pwPendingFile;
-          log('🎯 拦截 showOpenFilePicker, 阻止原生对话框', 'info');
-
-          // 不调用 _origSOFP → 不弹出原生对话框 → 不触发 user activation 错误
-
-          // 延迟注入文件到 DOM file input（等千问内部状态准备好）
-          return new Promise(function(resolve) {
-            setTimeout(function() {
-              var inp = findFileInput();
-              if (inp) {
-                setFileToInput(inp, f);
-                _pwPendingFile = null;
-              }
-              // 返回一个没法用的 mock 句柄，但千问会从 input change 事件拿到文件
-              resolve([{ name: f.name, kind: 'file', getFile: function() { return Promise.resolve(f); } }]);
-            }, 200);
-          });
+          log('intercept input.showPicker(type=file), injecting', 'info');
+          _doInject(_pwPendingFile);
+          return;
         }
-        if (_origSOFP) return _origSOFP.call(window, opts);
-        return Promise.reject(new Error('AbortError'));
+        return _origShowPicker.apply(this, arguments);
       };
     }
   }
 
   function unpatchFileInputHooks() {
-    _pwPendingFile = null;
-    _pwInjected = false;
+    _pwPendingFile = null; _pwInjected = false;
+    if (_origInputClick) { HTMLInputElement.prototype.click = _origInputClick; _origInputClick = null; }
+    if (_origShowPicker) { HTMLInputElement.prototype.showPicker = _origShowPicker; _origShowPicker = null; }
   }
 
   // ==================== 输入 Prompt ====================
@@ -779,184 +476,70 @@
     };
   }
 
-  // DOM 通道：获取新增回答 — v4.1.2 改为按 DOM 角色选择，不靠文本过滤
+  // DOM 通道：获取新增回答
   function getNewAnswerText(snapshot) {
-    // 千问 assistant 回合有两种常见容器：.qk-chat-agent / [class*="agent"] / data-role="assistant"
-    var allRounds = document.querySelectorAll(
+    var rounds = document.querySelectorAll(
       '[class*="chat-round"], [class*="ChatRound"], ' +
       '[class*="message-item"], [class*="MessageItem"], ' +
       '[class*="conversation-turn"], [class*="ConversationTurn"]'
     );
-    // 只取新增的、标记为 assistant 的回合
-    var newAssistantRounds = [];
-    if (allRounds.length > snapshot.rounds && snapshot.lastRound) {
+
+    var newRounds = [];
+    if (rounds.length > snapshot.rounds && snapshot.lastRound) {
       var startIdx = -1;
-      for (var i = 0; i < allRounds.length; i++) {
-        if (allRounds[i] === snapshot.lastRound) { startIdx = i + 1; break; }
+      for (var i = 0; i < rounds.length; i++) {
+        if (rounds[i] === snapshot.lastRound) { startIdx = i+1; break; }
       }
       if (startIdx < 0) startIdx = snapshot.rounds;
-      for (var j = startIdx; j < allRounds.length; j++) {
-        if (inside(allRounds[j])) continue;
-        // ★ 只要 assistant 回合，跳过用户自己的回合
-        if (isAssistantContainer(allRounds[j])) newAssistantRounds.push(allRounds[j]);
+      for (var j = startIdx; j < rounds.length; j++) {
+        if (!inside(rounds[j])) newRounds.push(rounds[j]);
       }
     }
-    // 优先从新增 assistant 回合取文本
+
     var best = '';
-    for (var k = 0; k < newAssistantRounds.length; k++) {
-      var md = newAssistantRounds[k].querySelector('.qk-markdown, .qk-markdown-react, [class*="markdown"]');
-      if (md && !inside(md)) {
-        var txt = (md.textContent || '').trim();
-        if (txt.length > best.length && txt.length > 100) best = txt;
-      }
-      if (best.length < 100) {
-        var txt2 = (newAssistantRounds[k].textContent || '').trim();
-        if (txt2.length > best.length && txt2.length > 200) best = txt2;
-      }
+    for (var k = 0; k < newRounds.length; k++) {
+      var md = newRounds[k].querySelector('.qk-markdown, .qk-markdown-react, [class*="markdown"]');
+      if (md && !inside(md)) { var t = (md.textContent||'').trim(); if (t.length > best.length && !isPrompt(t)) best = t; }
+      if (best.length < 50) { var t2 = (newRounds[k].textContent||'').trim(); if (t2.length > best.length && !isPrompt(t2)) best = t2; }
     }
-    // 兜底：全局 .qk-markdown 但只取 assistant 容器内的
-    if (best.length < 100) {
-      var mdBlocks = document.querySelectorAll('.qk-markdown, .qk-markdown-react, [class*="markdown-content"]');
+
+    var mdBlocks = document.querySelectorAll('.qk-markdown, .qk-markdown-react, [class*="markdown-content"]');
+    if (best.length < 100 && mdBlocks.length > snapshot.markdowns) {
       for (var m = snapshot.markdowns; m < mdBlocks.length; m++) {
         if (inside(mdBlocks[m])) continue;
-        if (!isInsideAssistant(mdBlocks[m])) continue;
-        var txt3 = (mdBlocks[m].textContent || '').trim();
-        if (txt3.length > best.length && txt3.length > 200) best = txt3;
+        var t3 = (mdBlocks[m].textContent||'').trim();
+        if (t3.length > best.length && !isPrompt(t3)) best = t3;
+      }
+    }
+
+    if (best.length < 200) {
+      var mains = document.querySelectorAll('main');
+      for (var n = mains.length-1; n >= 0; n--) {
+        if (inside(mains[n])) continue;
+        var divs = mains[n].querySelectorAll('div');
+        for (var p = divs.length-1; p >= 0; p--) {
+          if (inside(divs[p])) continue;
+          var t4 = (divs[p].textContent||'').trim();
+          if (t4.length < 300) continue;
+          if (isPrompt(t4)) continue;
+          if (t4.indexOf('新建对话')>=0 && t4.indexOf('智能体')>=0) continue;
+          if (t4.indexOf('API 服务')>=0 && t4.length<500) continue;
+          if (t4.length > best.length) best = t4;
+        }
       }
     }
     return best;
   }
 
-  // ★ 判断一个 DOM 元素是否在 assistant 回合内（而非用户回合 / 侧边栏）
-  function isInsideAssistant(el) {
-    // 千问 assistant 回合特征：class 含 agent / assistant，或 data-role="assistant"
-    if (!el) return false;
-    var cur = el;
-    while (cur) {
-      var cls = (cur.className || '').toString ? (cur.className || '').toString() : '';
-      if (/agent|assistant/i.test(cls)) return true;
-      var role = cur.getAttribute ? cur.getAttribute('data-role') || cur.getAttribute('role') : '';
-      if (/assistant/i.test(role)) return true;
-      cur = cur.parentElement;
-    }
-    return false;
-  }
-  function isAssistantContainer(el) { return isInsideAssistant(el); }
-
   function isPrompt(text) {
     if (!text) return false;
-    if (text.indexOf('你是 ')===0) return true;
+    if (text.indexOf('你是 WGS')===0) return true;
     if (text.indexOf('你是 ')===0 && text.indexOf('研究员')>5) return true;
     if (text.indexOf('<标题/作者')>=0 || text.indexOf('< 标题')>=0) return true;
-    if (text.indexOf('## 角色设定')>=0) return true;
-    if (text.indexOf('## 严格执行准则')>=0) return true;
     return false;
   }
 
-  // Validation
-  /**
-   * 结构化验证：判断捕获内容真的是 AI 精读笔记，还是用户 Prompt 回声 / 错误信息。
-   */
-  function isValidResponse(text, promptText) {
-    if (!text || text.length < 300) return { valid: false, reason: "short(" + (text?text.length:0) + ")" };
-    // ━━ 排除用户 Prompt 回声 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    if (/^#{1,3}\s*角色设定/m.test(text)) {
-      return { valid: false, reason: "检测到用户 Prompt 回声（角色设定）" };
-    }
-    if (/<标题\/作者\/机构/.test(text) || /<制备条件/.test(text)) {
-      return { valid: false, reason: "检测到未填充的 Prompt 占位符模板" };
-    }
-    // ━━ 排除平台拒绝 / 错误 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    var refuse = [
-      /抱歉.{0,20}(无法|不能).{0,20}(处理|读取|识别|访问)/,
-      /I('m| am) sorry.{0,30}(cannot|unable)/i,
-      /请提供.{0,10}(文件|文档|PDF|内容)/,
-      /Please (upload|provide|attach).{0,15}(file|document)/i,
-      /(错误|异常).{0,10}(处理|读取|上传|生成)/,
-      /(服务|系统).{0,10}(繁忙|拥挤|不可用|暂时)/,
-    ];
-    for (var ri=0; ri<refuse.length; ri++) {
-      if (refuse[ri].test(text)) {
-        return { valid: false, reason: "检测到拒绝/错误: " + text.substring(0, 80).replace(/\n/g, " ") };
-      }
-    }
-    // ━━ 正向验证：必须包含真实学术笔记特征 ━━━━━━━━━━━━━━━━━━━━━━
-    var hasDOI = /DOI[：:\s]*10\.\d{4,}/i.test(text);
-    var hasJournal = /期刊[：:\s]*[A-Z].{3,}(et al|Vol|vol|\(\d{4}\))/.test(text)
-                  || /[A-Z][a-z]+ [A-Z][a-z]+.{0,40}\d{4}/.test(text.substring(0, 2000));
-    var hasAuthor = /(作者|Authors?)[：:\s]*[A-Z一-鿿]{2,}/.test(text)
-                 || /(第一作者|通讯|通讯作者|Corresponding)/.test(text);
-    if (!hasDOI && !hasJournal && !hasAuthor) {
-      return { valid: false, reason: "未检测到真实文献引用信息（DOI/期刊/作者均缺失）" };
-    }
-    var secMatch = text.match(/^(?:#{1,4}\s*(?:[1-7]\.?\s*)?|▎\d\.?\s*|【.*】)(?:文献(?:基本信息|卡片|档案|概览)|研究(?:背景|动机)|(?:科学|研究)?问题|方法|(?:实验|研究)?(?:方法|路线|方案)|(?:技术|工艺)路线|(?:核心|主要)?(?:结果|发现)|(?:创新|贡献|(?:技术)?亮点)|局限|展望|(?:原文|全文)?(?:摘要|精要|总结|速览))/gm);
-    var secCount = secMatch ? secMatch.length : 0;
-    if (secCount < 4 && text.length < 8000) {
-      return { valid: false, reason: "7段结构章节标题不足(" + secCount + "/4)" };
-    }
-    return { valid: true, reason: "ok:" + text.length + " " + secCount + "/7" };
-  }
-
-  // Time window
-  function isWithinSchedule(cfg){
-    if(!cfg.scheduleStart||!cfg.scheduleEnd)return true;
-    var n=new Date(),nm=n.getHours()*60+n.getMinutes();
-    var sh=parseInt(cfg.scheduleStart.split(":")[0]),sm=parseInt(cfg.scheduleStart.split(":")[1]);
-    var eh=parseInt(cfg.scheduleEnd.split(":")[0]),em=parseInt(cfg.scheduleEnd.split(":")[1]);
-    var smi=sh*60+sm,emi=eh*60+em;
-    if(smi<=emi)return nm>=smi&&nm<=emi;else return nm>=smi||nm<=emi;
-  }
-  function getNextScheduleStart(cfg){
-    if(!cfg.scheduleStart)return null;
-    var sh=parseInt(cfg.scheduleStart.split(":")[0]),sm=parseInt(cfg.scheduleStart.split(":")[1]);
-    var t=new Date();t.setHours(sh,sm,0,0);if(t<=new Date())t.setDate(t.getDate()+1);return t;
-  }
-  function formatTimeRemaining(ms){
-    if(ms<=0)return "now";var h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);
-    if(h>0)return h+"h"+m+"m";return m+"m";
-  }
-  function updateScheduleStatus(cfg){
-    if(!STATE.ui||!STATE.ui.scheduleStatus)return;
-    var c=cfg||getConfig();
-    if(!c.scheduleStart||!c.scheduleEnd){STATE.ui.scheduleStatus.textContent="(off)";STATE.ui.scheduleStatus.style.color="#aaa";return;}
-    if(isWithinSchedule(c)){STATE.ui.scheduleStatus.textContent="OK";STATE.ui.scheduleStatus.style.color="#4ade80";}
-    else{var n=getNextScheduleStart(c);STATE.ui.scheduleStatus.textContent="wait "+formatTimeRemaining(n?n-new Date():0);STATE.ui.scheduleStatus.style.color="#f59e0b";}
-  }
-
-  // New chat
-  async function startNewChat(){
-    log("new chat...","info");await sleep(3000);
-    var bs=document.querySelectorAll("button, a, [role=\"button\"]");
-    var kw=["new","new chat","+"];
-    for(var i=0;i<bs.length;i++){
-      if(inside(bs[i]))continue;var t=(bs[i].textContent||"").trim().toLowerCase();
-      for(var k=0;k<kw.length;k++){if(t.indexOf(kw[k])>=0){bs[i].click();await sleep(3000);return true;}}
-    }
-    try{if(STATE.running)setResumeState('新建对话-URL跳转');window.location.href="/chat";await sleep(8000);return true;}catch(e){return false;}
-  }
-
-  // Cooldown
-  async function cooldownAndWake(cfg){
-    var cooldownMs=(cfg.cooldownMinutes||120)*60000;
-    log("cooldown "+Math.round(cooldownMs/60000)+"min...","warn");
-    persistLog("cooldown "+Math.round(cooldownMs/60000)+"min","warn");
-    var start=Date.now();
-    while(Date.now()-start<cooldownMs){if(!STATE.running)return;await sleep(1000);}
-    if(!STATE.running)return;
-    log("wakeup...","info");
-    await startNewChat();await sleep(2000);
-    var wp=cfg.wakeupPrompt||"hello";
-    var ok=await typePromptIntoChat(wp);
-    if(ok){await sleep(1500);startCollecting();clickSendButton();await sleep(180000);stopCollecting();log("wakeup done","success");}
-    await sleep(2000);await startNewChat();
-  }
-
-  // Dedup helpers
-  function hashText(text){var n=text.length;if(n<100)return text.substring(0,50)+"|"+n;return text.substring(0,80)+"|"+text.substring(Math.floor(n*.25),Math.floor(n*.25)+60)+"|"+text.substring(Math.floor(n*.5),Math.floor(n*.5)+60)+"|"+text.substring(Math.floor(n*.75),Math.floor(n*.75)+60)+"|"+text.substring(n-80)+"|"+n;}
-  function isPreviouslySaved(text){var h=hashText(text);if(STATE.processedHashes.indexOf(h)>=0)return true;if(STATE.baselineFingerprints.has(h))return true;return false;}
-  function markBaseline(){var fps=new Set(STATE.processedHashes);var ms=document.querySelectorAll(".qk-markdown,.qk-markdown-react,[class*=\"markdown\"]");for(var i=0;i<ms.length;i++){if(inside(ms[i]))continue;var t=(ms[i].textContent||"").trim();if(t.length>50)fps.add(hashText(t));}STATE.baselineFingerprints=fps;return fps;}
-
-
+  // v4.3.0: 纯 DOM 通道，不依赖网络拦截
   async function waitForResponseComplete(snapshot) {
     var cfg = getConfig();
     var timeoutMs = cfg.responseTimeoutMinutes * 60 * 1000;
@@ -965,68 +548,42 @@
     var interval = 2000;
 
     var start = Date.now();
-    var lastNetText = '';
-    var lastDomText = '';
+    var lastText = '';
     var lastChangeTime = 0;
 
-    log('⏳ 等待回答(网络拦截+DOM双通道, 超时='+cfg.responseTimeoutMinutes+'分)', 'info');
+    log('Waiting for answer (DOM, timeout='+cfg.responseTimeoutMinutes+'min)', 'info');
 
     while (Date.now() - start < timeoutMs) {
       while (STATE.paused && STATE.running) { await sleep(1000); }
       if (!STATE.running) return null;
 
-      // ★ 通道1: 网络拦截数据
-      var netText = NET.collectedText || '';
-      var netActivity = NET.lastActivity;
-
-      // ★ 通道2: DOM 扫描
       var domText = getNewAnswerText(snapshot);
 
-      // 取两个通道中最好的结果
-      var currentText = (netText.length > domText.length) ? netText : domText;
-
-      if (currentText && currentText.length > 100) {
-        if (currentText !== lastNetText) {
-          lastNetText = currentText;
+      if (domText && domText.length > 100) {
+        if (domText !== lastText) {
+          lastText = domText;
           lastChangeTime = Date.now();
         }
 
         var stableDuration = Date.now() - lastChangeTime;
         var elapsed = Date.now() - start;
 
-        // 网络层有新数据 → 记录活动时间
-        if (netText && netText !== lastNetText) {
-          lastDomText = netText;
-        }
-
         if (stableDuration >= stableMs && elapsed >= minWaitMs) {
-          var source = netText.length >= domText.length ? '网络拦截' : 'DOM扫描';
-          log('✅ 回答完成('+currentText.length+'字符, '+source+')', 'success');
-          stopCollecting();
-          return currentText;
-        }
-
-        if (currentText.length > (lastDomText||'').length) {
-          var growth = currentText.length - (lastDomText||'').length;
-          if (growth > 20) log('📝 生成中('+currentText.length+'字符, +'+growth+')', 'info');
-          lastDomText = currentText;
+          log('Answer complete ('+domText.length+' chars, DOM)', 'success');
+          return domText;
         }
       }
 
       await sleep(interval);
     }
 
-    // 超时：返回已有的最佳内容
-    var final = stopCollecting();
-    if (final.length > 100) {
-      log('⚠️ 超时，返回网络拦截内容('+final.length+'字符)', 'warn');
-      return final;
+    // timeout: return best from DOM
+    var finalDom = getNewAnswerText(snapshot);
+    if (finalDom.length > 100) {
+      log('Timeout, returning DOM content ('+finalDom.length+' chars)', 'warn');
+      return finalDom;
     }
-    if (lastDomText.length > 100) {
-      log('⚠️ 超时，返回DOM扫描内容('+lastDomText.length+'字符)', 'warn');
-      return lastDomText;
-    }
-    log('❌ 等待超时，无有效回答', 'error');
+    log('Timeout, no valid answer', 'error');
     return null;
   }
 
@@ -1050,14 +607,11 @@
   }
 
   // ★ v3.0.3: save with multi-tier fallback (clipboard first, then a.click, then GM_download)
-  // v4.0.0: save with PDF prefix, multi-tier fallback
-  async function saveResponse(text, title, cfg, originalPdfName) {
+  async function saveResponse(text, title, cfg) {
     if (!cfg.autoSave) return false;
-    var prefix = originalPdfName ? originalPdfName.replace(/\.pdf$/i,'').replace(/[\\/:*?"<>|]/g,'_').substring(0,50) : '';
-    var titleClean = title.replace(/[\\/:*?"<>|]/g,'_').substring(0,50);
-    var fn = (prefix ? prefix + '_' : '') + titleClean + '.md';
+    var fn = title.replace(/[\\/:*?"<>|]/g,'_').substring(0,60)+'.md';
 
-    // Tier 0: clipboard backup
+    // Tier 0: clipboard backup (always try first, so content is never lost)
     try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(text); log('📋 已复制到剪贴板 (保底)', 'info'); } } catch(e) {}
 
     // Tier 1 (primary): Blob + a.click() — proven reliable in v3.0.2
@@ -1186,7 +740,7 @@
       // Step 6: 输入 Prompt
       var promptOk = false;
       if (cfg.autoPrompt && cfg.promptText) {
-        promptOk = await typePromptIntoChat(getRotatedPrompt());
+        promptOk = await typePromptIntoChat(cfg.promptText);
         if (promptOk) {
           await sleep(800);
           var ed = findInputBox();
@@ -1209,11 +763,10 @@
         return false;
       }
 
-      // Step 7: ★ 启动网络拦截 → 拍快照 → 发送
+      // Step 7: 拍 DOM 快照 → 发送
       await sleep(cfg.sendDelaySeconds * 1000);
-      startCollecting();
       var snapshot = countMessageBubbles();
-      log('📸 快照: '+snapshot.rounds+'轮, 网络拦截已启动', 'info');
+      log('Snapshot: '+snapshot.rounds+' rounds', 'info');
 
       clickSendButton();
 
@@ -1221,36 +774,17 @@
       var responseText = await waitForResponseComplete(snapshot);
 
       if (responseText) {
-        var v = isValidResponse(responseText, cfg.promptText);
-        if (v.valid) {
-          log('valid response: '+v.reason, 'success');
-          var title = extractTitle(responseText, name);
-          var s = await saveResponse(responseText, title, cfg, name);
-          if(s) { log('saved: '+title+'.md', 'success'); persistLog('DONE: '+name, 'success'); }
-          else { log('save failed', 'warn'); persistLog('SAVEFAIL: '+name, 'warn'); }
-          addUploaded(name, 'success');
-          STATE.consecutiveFailures=0; updateStats();
-          unpatchFileInputHooks(); return true;
-        } else {
-          log('INVALID: '+v.reason, 'error');
-          persistLog('INVALID: '+name+' - '+v.reason, 'error');
-          addUploaded(name, 'invalid');
-          STATE.consecutiveFailures++; updateStats();
-          unpatchFileInputHooks();
-          await cooldownAndWake(cfg); return false;
-        }
+        log('📝 收到回答('+responseText.length+'字符)', 'info');
+        var title = extractTitle(responseText, name);
+        await saveResponse(responseText, title, cfg);
       } else {
-        log('no response', 'warn');
-        persistLog('NOREPLY: '+name, 'warn');
-        addUploaded(name, 'no_response');
-        STATE.consecutiveFailures++; updateStats();
-        if(STATE.consecutiveFailures>=2){unpatchFileInputHooks();await cooldownAndWake(cfg);return false;}
+        log('⚠️ 未获取到回答', 'warn');
       }
 
+      addUploaded(name); updateStats();
       unpatchFileInputHooks();
-      return false;
+      return true;
     } catch(e) {
-      stopCollecting();
       unpatchFileInputHooks();
       log('❌ 异常: '+name+' - '+e.message, 'error'); return false;
     }
@@ -1260,7 +794,6 @@
   async function runUploadLoop() {
     var cfg = getConfig();
     STATE.running = true; STATE.paused = false; updateButtons();
-    setResumeState('开始批量上传');
     log('▶ 开始: '+STATE.queue.length+'个文件, 间隔'+cfg.intervalMinutes+'分, 网络拦截模式', 'info');
 
     for (var i=0; i<STATE.queue.length; i++) {
@@ -1269,7 +802,6 @@
       STATE.currentIndex = i; updateStats(); updateQueueList();
       var item = STATE.queue[i];
       if (getUploadedSet().has(item.name)) { log('⏭ 跳过: '+item.name, 'info'); continue; }
-      setResumeState('处理中: '+item.name);
       await uploadOneFile(item);
       if (i < STATE.queue.length-1) {
         var wait = Math.max(30000, cfg.intervalMinutes*60000 + (Math.random()-0.5)*60000);
@@ -1279,7 +811,6 @@
       }
     }
     STATE.running = false; STATE.paused = false; STATE.currentIndex = -1;
-    clearResumeState();
     updateButtons(); updateStats(); log('✅ 上传结束', 'success');
   }
 
@@ -1384,7 +915,6 @@
       STATE.ui.logContainer.scrollTop = STATE.ui.logContainer.scrollHeight;
     }
     if (level==='error') console.error(line); else if (level==='warn') console.warn(line); else console.log(line);
-    persistLog(msg, level);
   }
 
   // ==================== UI ====================
@@ -1419,10 +949,7 @@
 '.qw-drop-overlay{position:fixed;inset:0;z-index:99998;background:rgba(16,185,129,.15);border:3px dashed #10b981;display:none;align-items:center;justify-content:center;pointer-events:none;}.qw-drop-overlay.active{display:flex;}'+
 '.qw-drop-text{background:rgba(26,26,46,.95);color:#10b981;padding:24px 48px;border-radius:16px;font-size:20px;font-weight:700;}'+
 '.qw-content::-webkit-scrollbar,.qw-log-container::-webkit-scrollbar,.qw-queue-list::-webkit-scrollbar{width:4px;}'+
-'.qw-content::-webkit-scrollbar-thumb,.qw-log-container::-webkit-scrollbar-thumb,.qw-queue-list::-webkit-scrollbar-thumb{background:#3a3a5a;border-radius:2px;}'+
-'.qw-prompt-tab{padding:5px 10px;border-radius:6px 6px 0 0;background:#0d0d1a;color:#6a6a8a;font-size:11px;cursor:pointer;border:1px solid transparent;display:inline-block;}'+
-'.qw-prompt-tab:hover{color:#aaa;background:#16213e;}.qw-prompt-tab.active{background:#16213e;color:#10b981;border-color:#2a2a4a;border-bottom-color:#16213e;font-weight:600;}'+
-'.qw-queue-item{cursor:pointer;}.qw-queue-item.invalid{color:#ef4444;}.qw-queue-item.selected{background:rgba(245,158,11,.15);color:#f59e0b;}'
+'.qw-content::-webkit-scrollbar-thumb,.qw-log-container::-webkit-scrollbar-thumb,.qw-queue-list::-webkit-scrollbar-thumb{background:#3a3a5a;border-radius:2px;}'
     );
 
     var dropOverlay = document.createElement('div');
@@ -1436,7 +963,7 @@
     panel.id = PANEL_ID;
     panel.innerHTML =
 '<div class="qw-header" id="qw-header-drag">'+
-' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.1.1</span>'+
+' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.3.0</span>'+
 ' <span class="qw-header-spacer"></span>'+
 ' <button class="qw-header-btn" id="qw-btn-minimize" title="最小化">−</button>'+
 '</div>'+
@@ -1457,8 +984,6 @@
 '  <div class="qw-row"><span class="qw-label">回答超时</span><input type="number" class="qw-input" id="qw-input-timeout" min="1" step="1" value="'+cfg.responseTimeoutMinutes+'"><span style="color:#999;font-size:11px;">分</span></div>'+
 '  <div class="qw-row"><span class="qw-label">稳定判定</span><input type="number" class="qw-input" id="qw-input-stable" min="3" step="1" value="'+cfg.responseStableSeconds+'"><span style="color:#999;font-size:11px;">秒 — N秒不变→完成</span></div>'+
 '  <div class="qw-row"><span class="qw-label">最短等待</span><input type="number" class="qw-input" id="qw-input-minwait" min="10" step="1" value="'+cfg.responseMinWaitSeconds+'"><span style="color:#999;font-size:11px;">秒 — 至少等N秒</span></div>'+
-'  <div class="qw-row"><span class="qw-label">冷却时间</span><input type="number" class="qw-input" id="qw-input-cooldown" min="10" step="10" value="'+(cfg.cooldownMinutes||120)+'" style="width:50px;"><span style="color:#999;font-size:11px;">分(无效后冷却)</span></div>'+
-'  <div class="qw-row"><span class="qw-label">时间窗口</span><input type="time" id="qw-input-schedule-start" style="background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:4px 6px;font-size:11px;width:100px;" value="'+(cfg.scheduleStart||'')+'"><span style="color:#aaa;font-size:11px;">-</span><input type="time" id="qw-input-schedule-end" style="background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:4px 6px;font-size:11px;width:100px;" value="'+(cfg.scheduleEnd||'')+'"><span style="color:#aaa;font-size:10px;" id="qw-schedule-status">(off)</span></div>'+
 ' </div>'+
 ' <hr class="qw-divider">'+
 ' <div class="qw-section">'+
@@ -1469,10 +994,8 @@
 ' </div>'+
 ' <hr class="qw-divider">'+
 ' <div class="qw-section">'+
-'  <div class="qw-section-title">📝 Prompt模板 (轮换)</div>'+
-'  <div style="display:flex;gap:2px;margin-bottom:2px;"><span class="qw-prompt-tab active" data-tab="0">#0</span><span class="qw-prompt-tab" data-tab="1">#1</span></div>'+
-'  <textarea id="qw-textarea-prompt" style="width:100%;height:60px;background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:0 6px 6px 6px;padding:6px 10px;font-size:11px;line-height:1.4;resize:vertical">'+escHtml(cfg.promptText||DEFAULT_PROMPT)+'</textarea>'+
-'  <div class="qw-row" style="gap:6px;margin-top:2px;"><label style="color:#aaa;font-size:11px;display:flex;align-items:center;gap:3px;"><input type="checkbox" id="qw-checkbox-auto-rotate"> 自动轮换</label><span style="color:#6a6a8a;font-size:10px;" id="qw-rotate-index">轮换: -</span></div>'+
+'  <div class="qw-section-title">📝 Prompt模板</div>'+
+'  <textarea id="qw-textarea-prompt" style="width:100%;height:60px;background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:6px 10px;font-size:11px;line-height:1.4;resize:vertical">'+escHtml(cfg.promptText||DEFAULT_PROMPT)+'</textarea>'+
 '  <div class="qw-row" style="gap:6px"><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-save-prompt">保存</button><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-reset-prompt">恢复默认</button></div>'+
 ' </div>'+
 ' <hr class="qw-divider">'+
@@ -1488,14 +1011,9 @@
 '  <button class="qw-btn qw-btn-warn" id="qw-btn-pause" disabled>⏸ 暂停</button>'+
 '  <button class="qw-btn qw-btn-danger" id="qw-btn-stop" disabled>⏹ 停止</button>'+
 '  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-reset">🔄 重置</button>'+
-'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-export-log">📜 导出日志</button>'+
-'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-import-log">📥 读取日志</button>'+
-'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-retry-failed" disabled>🔁 重试失败</button>'+
-'  <button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-upload-selected" disabled>📌 上传选中</button>'+
 ' </div>'+
-' <div class="qw-row" style="gap:4px;margin-top:4px;"><input type="text" id="qw-input-range" style="flex:1;background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:4px 8px;font-size:11px;" placeholder="按序号: 1,3,5-10"><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-upload-range">上传指定</button></div>'+
 ' <hr class="qw-divider">'+
-' <div class="qw-section"><div class="qw-section-title">📜 日志</div><div class="qw-log-container" id="qw-log-container"><div class="qw-log-entry qw-log-info">🚀 Pro v4.1.1 已启动</div><div class="qw-log-entry qw-log-info">📌 选择文件夹或拖拽PDF开始</div></div></div>'+
+' <div class="qw-section"><div class="qw-section-title">📜 日志</div><div class="qw-log-container" id="qw-log-container"><div class="qw-log-entry qw-log-info">🚀 Pro v3.0.3 已启动 (a.click+GM_download+剪贴板)</div><div class="qw-log-entry qw-log-info">📌 选择文件夹或拖拽PDF开始</div></div></div>'+
 '</div>';
     document.body.appendChild(panel);
 
@@ -1510,17 +1028,9 @@
       inputParse:panel.querySelector('#qw-input-parse'), inputSendDelay:panel.querySelector('#qw-input-send-delay'),
       inputTimeout:panel.querySelector('#qw-input-timeout'), inputStable:panel.querySelector('#qw-input-stable'),
       inputMinWait:panel.querySelector('#qw-input-minwait'), inputInterval:panel.querySelector('#qw-input-interval'),
-      inputCooldown:panel.querySelector('#qw-input-cooldown'),
-      inputScheduleStart:panel.querySelector('#qw-input-schedule-start'), inputScheduleEnd:panel.querySelector('#qw-input-schedule-end'),
-      scheduleStatus:panel.querySelector('#qw-schedule-status'),
       checkboxAutoPrompt:panel.querySelector('#qw-checkbox-autoprompt'), checkboxAutoSave:panel.querySelector('#qw-checkbox-autosave'),
-      checkboxAutoRotate:panel.querySelector('#qw-checkbox-auto-rotate'),
-      rotateIndex:panel.querySelector('#qw-rotate-index'),
       textareaPrompt:panel.querySelector('#qw-textarea-prompt'),
       btnSavePrompt:panel.querySelector('#qw-btn-save-prompt'), btnResetPrompt:panel.querySelector('#qw-btn-reset-prompt'),
-      btnExportLog:panel.querySelector('#qw-btn-export-log'), btnImportLog:panel.querySelector('#qw-btn-import-log'),
-      btnRetryFailed:panel.querySelector('#qw-btn-retry-failed'), btnUploadSelected:panel.querySelector('#qw-btn-upload-selected'),
-      btnUploadRange:panel.querySelector('#qw-btn-upload-range'), inputRange:panel.querySelector('#qw-input-range'),
       queueCount:panel.querySelector('#qw-queue-count'), uploadedCount:panel.querySelector('#qw-uploaded-count'),
       currentFile:panel.querySelector('#qw-current-file'), progressFill:panel.querySelector('#qw-progress-fill'),
       queueList:panel.querySelector('#qw-queue-list'), logContainer:panel.querySelector('#qw-log-container'),
@@ -1556,112 +1066,9 @@
       await runUploadLoop();
     });
     ui.btnPause.addEventListener('click', function(){ if(!STATE.running)return; STATE.paused=!STATE.paused; ui.btnPause.textContent=STATE.paused?'▶ 继续':'⏸ 暂停'; log(STATE.paused?'⏸ 已暂停':'▶ 已恢复','warn'); });
-    ui.btnStop.addEventListener('click', function(){ STATE.running=false; STATE.paused=false; stopCollecting(); clearResumeState(); updateButtons(); log('⏹ 已停止','warn'); });
+    ui.btnStop.addEventListener('click', function(){ STATE.running=false; STATE.paused=false; updateButtons(); log('Stopped','warn'); });
     ui.btnReset.addEventListener('click', function(){ if(confirm('清除上传记录？')){ clearUploaded(); updateStats(); updateQueueList(); log('🔄 已重置','warn'); } });
     ui.btnMinimize.addEventListener('click', function(){ STATE.ui.panel.classList.toggle('qw-collapsed'); });
-
-    // v4.0.0 new handlers (safety-checked)
-    if(ui.inputCooldown) ui.inputCooldown.addEventListener('change',function(){var v=parseInt(ui.inputCooldown.value)||120;STATE.config.cooldownMinutes=Math.max(10,v);saveConfig();});
-    if(ui.inputScheduleStart) ui.inputScheduleStart.addEventListener('change',function(){STATE.config.scheduleStart=ui.inputScheduleStart.value;saveConfig();updateScheduleStatus();});
-    if(ui.inputScheduleEnd) ui.inputScheduleEnd.addEventListener('change',function(){STATE.config.scheduleEnd=ui.inputScheduleEnd.value;saveConfig();updateScheduleStatus();});
-    if(ui.checkboxAutoRotate) ui.checkboxAutoRotate.addEventListener('change',function(){STATE.config.autoRotateEnabled=ui.checkboxAutoRotate.checked;saveConfig();updateRotateIndex();});
-
-    // Prompt tabs
-    if(ui.textareaPrompt&&ui.textareaPrompt.parentElement){
-      var tabs=ui.textareaPrompt.parentElement.querySelectorAll('.qw-prompt-tab');
-      for(var ti=0;ti<tabs.length;ti++){
-        tabs[ti].addEventListener('click',function(e){
-          var t=parseInt(e.target.dataset.tab);
-          if(!isNaN(t)){STATE.config.activePromptTab=t;ui.textareaPrompt.value=PROMPT_POOL[t]||DEFAULT_PROMPT;saveConfig();
-            var allT=ui.textareaPrompt.parentElement.querySelectorAll('.qw-prompt-tab');
-            for(var aj=0;aj<allT.length;aj++)allT[aj].classList.toggle('active',parseInt(allT[aj].dataset.tab)===t);
-          }
-        });
-      }
-    }
-
-    // Export/Import log
-    if(ui.btnExportLog) ui.btnExportLog.addEventListener('click',function(){exportLogToFile();log('log exported','success');});
-    if(ui.btnImportLog) ui.btnImportLog.addEventListener('click',function(){
-      var inp=document.createElement('input');inp.type='file';inp.accept='.txt';inp.style.display='none';
-      document.body.appendChild(inp);
-      inp.addEventListener('change',async function(e){
-        var f=e.target.files[0];if(!f){document.body.removeChild(inp);return;}
-        try{var t=await f.text();var r=parseLogAndRestore(t);log('restored '+r+' records','success');updateStats();updateQueueList();updateRetryFailedButton();}catch(err){log('import fail: '+err.message,'error');}
-        document.body.removeChild(inp);
-      });
-      inp.click();
-    });
-
-    // Retry
-    if(ui.btnRetryFailed) ui.btnRetryFailed.addEventListener('click',async function(){
-      if(STATE.running)return;
-      var recs=getUploadRecords();
-      var failed=recs.filter(function(r){return r.status==='invalid'||r.status==='no_response';}).map(function(r){return r.name;});
-      if(!failed.length){log('no failed','warn');return;}
-      for(var f=0;f<failed.length;f++)removeUploaded(failed[f]);
-      updateStats();updateQueueList();
-      var rq=STATE.queue.filter(function(q){return failed.indexOf(q.name)>=0;});
-      STATE.running=true;STATE.paused=false;updateButtons();
-      for(var ri=0;ri<rq.length;ri++){
-        while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;
-        log('retry['+(ri+1)+'/'+rq.length+']: '+rq[ri].name,'info');
-        await uploadOneFile(rq[ri]);
-        if(ri<rq.length-1&&STATE.running){var w=Math.max(30000,getConfig().intervalMinutes*60000);var ws=Date.now();while(Date.now()-ws<w){while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;await sleep(1000);}}
-      }
-      STATE.running=false;STATE.paused=false;updateButtons();updateStats();updateQueueList();updateRetryFailedButton();
-    });
-
-    // Upload selected
-    if(ui.btnUploadSelected) ui.btnUploadSelected.addEventListener('click',async function(){
-      var sel=Object.keys(selectedFiles).filter(function(k){return selectedFiles[k];});
-      if(!sel.length){log('none selected','warn');return;}
-      if(STATE.running)return;
-      var sq=STATE.queue.filter(function(q){return selectedFiles[q.name];});
-      for(var s=0;s<sq.length;s++)removeUploaded(sq[s].name);
-      updateStats();updateQueueList();
-      STATE.running=true;STATE.paused=false;updateButtons();
-      for(var si=0;si<sq.length;si++){
-        while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;
-        log('sel['+(si+1)+'/'+sq.length+']: '+sq[si].name,'info');
-        await uploadOneFile(sq[si]);
-        if(si<sq.length-1&&STATE.running){var w2=Math.max(30000,getConfig().intervalMinutes*60000);var ws2=Date.now();while(Date.now()-ws2<w2){while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;await sleep(1000);}}
-      }
-      STATE.running=false;STATE.paused=false;
-      for(var n=0;n<sel.length;n++)selectedFiles[sel[n]]=false;
-      updateButtons();updateStats();updateQueueList();
-    });
-
-    // Upload range
-    if(ui.btnUploadRange) ui.btnUploadRange.addEventListener('click',async function(){
-      var rt=ui.inputRange.value.trim();if(!rt){log('enter range','warn');return;};
-      if(STATE.running)return;
-      var idx=parseRange(rt,STATE.queue.length);
-      if(!idx.length){log('bad range','warn');return;}
-      var rq2=idx.map(function(x){return STATE.queue[x];});
-      for(var rj=0;rj<rq2.length;rj++)removeUploaded(rq2[rj].name);
-      updateStats();updateQueueList();
-      STATE.running=true;STATE.paused=false;updateButtons();
-      for(var rk=0;rk<rq2.length;rk++){
-        while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;
-        log('range['+(rk+1)+'/'+rq2.length+'] #'+(idx[rk]+1)+': '+rq2[rk].name,'info');
-        await uploadOneFile(rq2[rk]);
-        if(rk<rq2.length-1&&STATE.running){var w3=Math.max(30000,getConfig().intervalMinutes*60000);var ws3=Date.now();while(Date.now()-ws3<w3){while(STATE.paused&&STATE.running)await sleep(1000);if(!STATE.running)break;await sleep(1000);}}
-      }
-      STATE.running=false;STATE.paused=false;updateButtons();updateStats();updateQueueList();
-    });
-
-    // Queue click to select
-    if(ui.queueList) ui.queueList.addEventListener('click',function(e){
-      var item=e.target.closest('.qw-queue-item');
-      if(!item||!item.dataset.qwidx)return;
-      var idx=parseInt(item.dataset.qwidx);
-      if(isNaN(idx)||idx>=STATE.queue.length)return;
-      var nm=STATE.queue[idx].name;
-      if(selectedFiles[nm])selectedFiles[nm]=false;else selectedFiles[nm]=true;
-      updateQueueList();
-      if(ui.btnUploadSelected){var c=Object.keys(selectedFiles).filter(function(k){return selectedFiles[k];}).length;ui.btnUploadSelected.disabled=c===0;ui.btnUploadSelected.textContent=c>0?'upload('+c+')':'upload selected';}
-    });
   }
 
   var dragState=null;
@@ -1698,20 +1105,13 @@
   }
   function updateQueueList() {
     var l=STATE.ui.queueList, up=getUploadedSet();
-    var recs=getUploadRecords();
     if (!STATE.queue.length) { l.innerHTML='<div style="color:#6a6a8a;font-size:11px;">暂无文件</div>'; return; }
     var show=STATE.queue.slice(0,50), h='';
     for(var i=0;i<show.length;i++){
       var cls='',dot='○';
-      var isUp=up.has(show[i].name);
-      var rec=recs.find(function(r){return r.name===show[i].name;});
-      if(isUp){
-        if(rec&&(rec.status==='invalid'||rec.status==='no_response')){cls='invalid';dot='✗';}
-        else{cls='done';dot='●';}
-      }
+      if(up.has(show[i].name)){cls='done';dot='●';}
       if(i===STATE.currentIndex&&STATE.running){cls='current';dot='▶';}
-      if(selectedFiles[show[i].name]){cls='selected';dot='📌';}
-      h+='<div class="qw-queue-item '+cls+'" data-qwidx="'+i+'"><span class="qw-queue-dot">'+dot+'</span><span>'+(i+1)+'. '+escHtml(show[i].name)+'</span></div>';
+      h+='<div class="qw-queue-item '+cls+'"><span class="qw-queue-dot">'+dot+'</span><span>'+escHtml(show[i].name)+'</span></div>';
     }
     l.innerHTML=h+(STATE.queue.length>50?'<div style="color:#6a6a8a;font-size:11px;padding:3px 6px;">...还有'+(STATE.queue.length-50)+'个</div>':'');
   }
@@ -1724,72 +1124,28 @@
 
   // ==================== 初始化 ====================
   async function init() {
-    loadPersistedLog();
-    var c=getConfig(),ch=false;
-    if(!c.cooldownMinutes){c.cooldownMinutes=120;ch=true;}
-    if(c.autoRotateEnabled===undefined){c.autoRotateEnabled=false;ch=true;}
-    if(ch)saveConfig();
-    STATE.lastSavedHash='';STATE.processedHashes=[];STATE.baselineFingerprints=new Set();
-    STATE.prompt_index=gmGet('prompt_index',0);
+    log('Pro v4.3.0 started (DOM-only, triple-hook)', 'info');
+    log('🌐 fetch劫持已激活 — 实时捕获千问API响应', 'info');
 
-    // create panel first so ui exists for logging
     createPanel();
-    updateRotateIndex();
-    log('v4.1.1 started','info');log('fetch hijack active','info');
-
-    // restore persisted logs to panel
-    if(STATE.logBuffer.length>0&&STATE.ui.logContainer){
-      var rl=STATE.logBuffer.slice(-50);
-      for(var j=0;j<rl.length;j++){
-        var e=rl[j],t=new Date(e.time).toTimeString().slice(0,8),d=new Date(e.time).toISOString().slice(0,10);
-        var di=document.createElement('div');di.className='qw-log-entry qw-log-'+e.level;
-        di.textContent='['+d+' '+t+'] '+({info:'i',success:'+',warn:'!',error:'X'})[e.level]+' '+e.msg;
-        STATE.ui.logContainer.appendChild(di);
-      }
-      STATE.ui.logContainer.scrollTop=STATE.ui.logContainer.scrollHeight;
-    }
-
-    updateScheduleStatus();
-    if(STATE.ui.inputScheduleStart)STATE.ui.inputScheduleStart.value=c.scheduleStart||'';
-    if(STATE.ui.inputScheduleEnd)STATE.ui.inputScheduleEnd.value=c.scheduleEnd||'';
 
     var h = await loadDirHandle();
     if (h) {
       STATE.dirHandle=h; STATE.config.folderDisplayName=h.name;
-      STATE.ui.folderDisplay.textContent='folder: '+h.name; STATE.ui.folderDisplay.classList.add('active');
+      STATE.ui.folderDisplay.textContent='📂 '+h.name; STATE.ui.folderDisplay.classList.add('active');
       STATE.ui.btnRefresh.disabled=false; saveConfig();
-      log('restored: '+h.name,'success');
+      log('📂 已恢复: '+h.name, 'success');
       await buildQueueFromDir(); STATE.ui.btnStart.disabled=STATE.queue.length===0;
-    } else { log('select folder or drag','info'); }
+    } else { log('📌 请选择文件夹或拖拽PDF', 'info'); }
 
     var up=getUploadedSet(); STATE.totalUploaded=up.size;
-    updateStats(); updateQueueList(); updateButtons(); updateRetryFailedButton();
-    if(up.size>0)log(up.size+' history','info');
+    updateStats(); updateQueueList(); updateButtons();
+    if (up.size>0) log('📊 '+up.size+'条历史上传记录', 'info');
 
     await sleep(3000);
     var ed=findInputBox();
-    if(ed)log('input ready','success');else log('no input','warn');
-
-    // v4.1.0: 断点自动恢复 — 上次运行被页面跳转/刷新中断时自动续传
-    window.addEventListener('beforeunload', function(){ if(STATE.running) setResumeState('页面卸载'); });
-    var resume = getResumeState();
-    if (resume) {
-      clearResumeState();
-      if (STATE.queue.length > 0) {
-        var upSet = getUploadedSet(), remaining = 0;
-        for (var qi=0; qi<STATE.queue.length; qi++) { if (!upSet.has(STATE.queue[qi].name)) remaining++; }
-        if (remaining > 0) {
-          log('🔁 检测到运行中断('+(resume.reason||'页面刷新')+')，8秒后自动恢复上传(剩余'+remaining+'个)。不需要恢复请点 ⏹ 停止', 'warn');
-          persistLog('自动恢复: '+(resume.reason||'页面刷新')+'，剩余 '+remaining+' 个', 'warn');
-          STATE.ui.btnStop.disabled = false;
-          setTimeout(function(){ if(!STATE.running && STATE.queue.length>0) runUploadLoop(); }, 8000);
-        } else {
-          log('🔁 检测到中断标记，但队列已全部完成', 'info');
-        }
-      } else {
-        log('⚠️ 检测到运行中断，但队列为空(文件夹权限可能失效)，请重新选择文件夹后点开始', 'warn');
-      }
-    }
+    if (ed) log('✅ 检测到千问输入框, 就绪', 'success');
+    else log('⚠️ 未检测到输入框', 'warn');
   }
 
   // @run-at document-start → 需要等 DOM ready
