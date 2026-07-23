@@ -1073,24 +1073,49 @@
     }
 
     // ==================== 回答质量验证 ====================
+    /**
+     * 结构化验证：判断捕获内容真的是 AI 精读笔记，还是用户 Prompt 回声 / 错误信息。
+     */
     function isValidResponse(text) {
         if (!text || text.length < 500) {
             return { valid: false, reason: '内容过短 (' + (text ? text.length : 0) + ' 字符, 需>=500)' };
         }
-        // 排除 DeepSeek 常见的拒绝/错误消息
-        const refusePatterns = [
-            /抱歉.{0,20}(无法|不能).{0,20}(处理|读取|识别)/,
+        // ━━ 排除用户 Prompt 回声 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if (/^#{1,3}\s*角色设定/m.test(text)) {
+            return { valid: false, reason: '检测到用户 Prompt 回声（角色设定）' };
+        }
+        if (/<标题\/作者\/机构/.test(text) || /<制备条件/.test(text)) {
+            return { valid: false, reason: '检测到未填充的 Prompt 占位符模板' };
+        }
+        // ━━ 排除平台拒绝 / 错误 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        const refuse = [
+            /抱歉.{0,20}(无法|不能).{0,20}(处理|读取|识别|访问)/,
             /I('m| am) sorry.{0,30}(cannot|unable)/i,
-            /请提供.{0,10}(文件|文档|PDF)/,
+            /请提供.{0,10}(文件|文档|PDF|内容)/,
             /Please (upload|provide|attach).{0,15}(file|document)/i,
-            /错误.{0,10}(处理|读取|上传)/,
+            /(错误|异常).{0,10}(处理|读取|上传|生成)/,
+            /(服务|系统).{0,10}(繁忙|拥挤|不可用|暂时)/,
         ];
-        for (const pattern of refusePatterns) {
-            if (pattern.test(text)) {
-                return { valid: false, reason: '检测到拒绝/错误回答: ' + text.substring(0, 100).replace(/\n/g, ' ') };
+        for (const p of refuse) {
+            if (p.test(text)) {
+                return { valid: false, reason: '检测到拒绝/错误: ' + text.substring(0, 80).replace(/\n/g, ' ') };
             }
         }
-        return { valid: true, reason: '有效回答 (' + text.length + ' 字符)' };
+        // ━━ 正向验证：必须包含真实学术笔记特征 ━━━━━━━━━━━━━━━━━━━━━━
+        const hasDOI = /DOI[：:\s]*10\.\d{4,}/i.test(text);
+        const hasJournal = /期刊[：:\s]*[A-Z].{3,}(et al|Vol|vol|\(\d{4}\))/.test(text)
+                        || /[A-Z][a-z]+ [A-Z][a-z]+.{0,40}\d{4}/.test(text.substring(0, 2000));
+        const hasAuthor = /(作者|Authors?)[：:\s]*[A-Z一-鿿]{2,}/.test(text)
+                       || /(第一作者|通讯|通讯作者|Corresponding)/.test(text);
+        if (!hasDOI && !hasJournal && !hasAuthor) {
+            return { valid: false, reason: '未检测到真实文献引用信息（DOI/期刊/作者均缺失）' };
+        }
+        const _sRe2 = /^(?:#{1,4}\s*(?:[1-7]\.?\s*)?|▎\d\.?\s*|【.*】)(?:文献(?:基本信息|卡片|档案|概览)|研究(?:背景|动机)|(?:科学|研究)?问题|方法|(?:实验|研究)?(?:方法|路线|方案)|(?:技术|工艺)路线|(?:核心|主要)?(?:结果|发现)|(?:创新|贡献|(?:技术)?亮点)|局限|展望|(?:原文|全文)?(?:摘要|精要|总结|速览))/gm;
+        const sections = text.match(_sRe2);
+        if (secCount < 4 && text.length < 8000) {
+            return { valid: false, reason: '7段结构章节标题不足(' + secCount + '/4)' };
+        }
+        return { valid: true, reason: '有效精读笔记 (' + text.length + ' 字符, ' + secCount + '/7 章节)' };
     }
 
     // ==================== 等待 AI 回答完成 ====================
