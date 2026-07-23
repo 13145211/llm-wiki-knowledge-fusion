@@ -839,6 +839,8 @@
     if (text.indexOf('你是 ')===0) return true;
     if (text.indexOf('你是 ')===0 && text.indexOf('研究员')>5) return true;
     if (text.indexOf('<标题/作者')>=0 || text.indexOf('< 标题')>=0) return true;
+    if (text.indexOf('## 角色设定')>=0) return true;
+    if (text.indexOf('## 严格执行准则')>=0) return true;
     return false;
   }
 
