@@ -16,7 +16,7 @@
 | 脚本 | 平台 | 版本 |
 |------|------|------|
 | `doubao-pdf-uploader-pro.user.js` | 豆包 | 4.5.0 |
-| `qianwen-pdf-uploader-pro.user.js` | 千问 | 4.1.0 |
+| `qianwen-pdf-uploader-pro.user.js` | 千问 | 4.1.1 |
 | `deepseek-pdf-uploader.user.js` | DeepSeek | 1.1.0 |
 
 批量上传 PDF → 自动输入精读 Prompt → 等待并校验回答 → 自动保存 Markdown 笔记。

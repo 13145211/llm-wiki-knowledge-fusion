@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         千问 PDF 批量上传器 Pro
 // @namespace    https://github.com/qclaw/qianwen-pdf-uploader
-// @version      4.1.0
-// @description  v4.1.0: 断点自动恢复|Prompt轮换|回答验证|日志|时间窗口|重试
+// @version      4.1.1
+// @description  v4.1.1: 断点自动恢复|通用七段法Prompt(默认固定)|回答验证|日志|时间窗口|重试
 // @author       QClaw
 // @match        https://www.qianwen.com/*
 // @match        https://qianwen.com/*
@@ -43,7 +43,7 @@
     promptDoneWaitSeconds: 2,         // Prompt 后等待（秒）
     presendWaitSeconds: 3,            // 发送前等待（秒）
     activePromptTab: 0,               // 当前激活的 Prompt 变体编号
-    autoRotateEnabled: true,          // 每篇自动轮换 Prompt 变体
+    autoRotateEnabled: false,          // 每篇自动轮换 Prompt 变体
     scheduleStart: '',                // 时间窗口开始（如 '08:00'，留空不限）
     scheduleEnd: ''                   // 时间窗口结束（如 '22:00'，留空不限）
   };
@@ -78,111 +78,94 @@
 
   // ==================== Prompt（通用文献七段法，2 个角色变体轮换） ====================
   var DEFAULT_PROMPT =
-`你是 学术文献精读方向的博士后研究员。
-你的任务是精读一篇学术文献，撰写 7 段结构化笔记。
+`## 角色设定
+你是专业严谨的科研助理，逻辑缜密、学术规范，严格依据论文**正文文字+所有实验图表**，撰写标准化7段式文献精读笔记，全程客观中立、有据可依。
 
-你必须完全忠实地报告**文献原文和图表中的信息**——不能编造任何数字、结论或引用。
-当文本和图像信息冲突时，以图像为准并注明矛盾。
-如果需要推断，必须标注"合理推断"或"作者未述"。
+## 严格执行准则
+1. 所有内容**完全来源于原文图文**，绝不编造、杜撰任何数据与结论
+2. 文字描述与图表数据冲突时，**以文本为准**，并注明图文数据存在不一致
+3. 主观推导、延伸分析统一标注**合理推断**，文献未提及内容标注**原文未说明**
+4. 所有关键参数、数值均标注来源：Fig.XX / Table.XX
+5. 所有附图、附表均**系统性深度识别解读**，不遗漏结构、趋势、差异、对比规律，不局限单一材料图谱参数
 
-## 1. 基本信息
-<标题/作者/机构/期刊/年份/DOI/通讯/关键词>
+---
+### 1. 文献基本信息
+论文标题、第一作者、通讯作者、发表期刊、发表年份、DOI编号、文章核心关键词
 
-## 2. 研究背景与问题
-<含(1)具体科学挑战 (2)已有方案不足 (3)本文目标>
+### 2. 研究背景与科学问题
+1. 该领域现阶段普遍存在的技术瓶颈、行业痛点与待解决科学难题
+2. 现有研究方案、材料、工艺、方法存在的短板与局限性
+3. 本文研究目的、核心待解决问题、验证假设与整体研究目标
 
-## 3. 方法/技术路线
-<研究对象与材料 + 实验/计算/调查设计(条件、参数、样本量) + 分析与表征手段 + 评价指标与测试条件>
+### 3. 实验方法与技术路线
+1. 样品制备、试验流程、分组对照、工艺条件、操作步骤与后处理方式
+2. 全部表征检测手段、测试仪器、实验工况与相关测试参数
+3. 数据分析、模型计算、机理推导、动力学与统计学处理方法
 
-## 4. 核心结果
-<含具体数字 + 图表引用 + 图像解读。每项结果必须注明依据来源>
+### 4. 结果规律与图表全面解读
+按核心发现逐条撰写：结论规律 + 具体量化数值 + 图表出处
+**通用图表识别体系（全学科通用）**
+- 物相/光谱类图谱：识别特征峰位置、峰形强弱、峰偏移、物相组成、结构变化规律
+- 形貌显微图片：分析颗粒尺寸、形貌特征、分散状态、界面结构、微观形貌差异
+- 性能趋势曲线：读取关键节点数值、变化趋势、最优区间、稳定性、组间对比差异
+- 数据对比表格：逐一核对正文引用数据与表格原始数值是否吻合一致
 
-## 5. 创新点
-<基于作者 abstract + conclusions 改写，用"作者报告/作者通过"+ 标"依据"。
-不得使用原文未出现的"首次/新发现/新路径"等绝对化措辞。>
+### 5. 研究创新点与学术价值
+基于摘要、结论客观总结，统一用词：作者探明……、作者验证……、作者得出……
+不擅自使用首次、突破性、开创性等绝对化夸张词汇，仅原文原话可引用
 
-## 6. 局限与展望
-<作者自陈 + 合理推断(标"合理推断"或"作者未述")>
+### 6. 研究局限与未来展望
+1. 作者原文自述的研究不足、试验条件限制、体系适用范围短板
+2. 实验设计、数据完整性、机理深度等潜在问题，统一标注**合理推断**
+3. 作者规划后续研究方向、优化思路与拓展应用前景
 
-## 7. 原始文本摘要
-<≤300 字，覆盖核心发现>
-
-当遇到以下类型图表时，必须从图像中读取具体值：
-
-【谱图/衍射图/色谱类】
-- 读出特征峰的位置、强度与归属标注
-- 由峰参数计算的衍生量是否与文本一致？不一致则标注
-- 注意是否有未解释的额外峰
-
-【显微/影像类照片】
-- 目测估算特征尺寸范围，与文本声称值对比
-- 注意形貌与分布均匀性
-- 高分辨图像：读出标注的特征间距/尺度，与文本对比
-
-【性能/趋势曲线】
-- 直接读取关键数据点，验证文本中数字是否正确
-- 观察趋势拐点与异常点
-- 时间序列：检测衰减/漂移趋势
-
-【统计类图表】
-- 读取均值、误差棒、显著性标注
-- 各组差异是否支持文本中的定性判断？
-
-【拟合/回归图】
-- 读出拟合参数(斜率、截距、R² 等)
-- 验证文本中给出的参数值
-- 检查离群点
-
-【Table 数据】
-- 扫描所有表格数据，验证文中引用的数字与表一致
-- 检查脚注
-
-完成 7 段后，执行以下自检：
-1. 数字反查：所有具体数字必须在原文或图表中找到对应值
-2. 创新点 clean check：不得出现绝对化措辞除非作者原文中出现
-3. 图表引用完整性：每个 Fig/Table/Scheme 必须可见且 caption 一致
-4. 引号原话：所有双引号中的英文句子必须在原文中出现
-5. 零占位符：不得出现 TODO/TBD 等占位文本`;
+### 7. 全文高度摘要
+字数≤300字，完整概括研究背景、实验思路、核心规律、关键数据与最终研究结论`;
 
   var QW_PROMPT_1 =
-`你是 一位拥有 15 年跨学科经验的资深研究员（Senior Researcher）。
-请仔细阅读以下学术文献，完成一份 7 模块的结构化分析报告。
+`## 角色设定
+你是专业严谨的科研助理，逻辑缜密、学术规范，严格依据论文**正文文字+所有实验图表**，撰写标准化7段式文献精读笔记，全程客观中立、有据可依。
 
-核心准则：
-- 严格基于原文和图表，不做任何数值或结论的臆造
-- 图像信息优先于文本描述（遇到矛盾请明确指出）
-- 任何超出原文的推论必须标注"推测"或"文中未提及"
+## 严格执行准则
+1. 所有内容**完全来源于原文图文**，绝不编造、杜撰任何数据与结论
+2. 文字描述与图表数据冲突时，**以文本为准**，并注明图文数据存在不一致
+3. 主观推导、延伸分析统一标注**合理推断**，文献未提及内容标注**原文未说明**
+4. 所有关键参数、数值均标注来源：Fig.XX / Table.XX
+5. 所有附图、附表均**系统性深度识别解读**，不遗漏结构、趋势、差异、对比规律，不局限单一材料图谱参数
 
-## Module A — 文献概览
-<含完整引用信息：标题/作者/机构/期刊/年份/DOI/通讯联系人/研究关键词>
+---
+### 1. 文献基本信息
+论文标题、第一作者、通讯作者、发表期刊、发表年份、DOI编号、文章核心关键词
 
-## Module B — 科学问题定位
-<概述：(1)领域核心挑战 (2)现有策略的瓶颈 (3)本文的解决思路>
+### 2. 研究背景与科学问题
+1. 该领域现阶段普遍存在的技术瓶颈、行业痛点与待解决科学难题
+2. 现有研究方案、材料、工艺、方法存在的短板与局限性
+3. 本文研究目的、核心待解决问题、验证假设与整体研究目标
 
-## Module C — 研究方案
-<对象与材料 + 实验/计算/调查设计细节 + 分析与表征面板 + 评价条件>
+### 3. 实验方法与技术路线
+1. 样品制备、试验流程、分组对照、工艺条件、操作步骤与后处理方式
+2. 全部表征检测手段、测试仪器、实验工况与相关测试参数
+3. 数据分析、模型计算、机理推导、动力学与统计学处理方法
 
-## Module D — 关键发现与数据
-<逐条列出主要发现，每条附带具体数值、对应图表编号、图像读出值。标注信息来源>
+### 4. 结果规律与图表全面解读
+按核心发现逐条撰写：结论规律 + 具体量化数值 + 图表出处
+**通用图表识别体系（全学科通用）**
+- 物相/光谱类图谱：识别特征峰位置、峰形强弱、峰偏移、物相组成、结构变化规律
+- 形貌显微图片：分析颗粒尺寸、形貌特征、分散状态、界面结构、微观形貌差异
+- 性能趋势曲线：读取关键节点数值、变化趋势、最优区间、稳定性、组间对比差异
+- 数据对比表格：逐一核对正文引用数据与表格原始数值是否吻合一致
 
-## Module E — 贡献分析
-<从作者视角总结创新之处，使用"作者发现/作者证明"表述。严禁使用原文未出现的"首次/首次提出"等>
+### 5. 研究创新点与学术价值
+基于摘要、结论客观总结，统一用词：作者探明……、作者验证……、作者得出……
+不擅自使用首次、突破性、开创性等绝对化夸张词汇，仅原文原话可引用
 
-## Module F — 不足与未来方向
-<作者自述的局限性 + 你的专业推测(标注"推测"或"文中未涉")>
+### 6. 研究局限与未来展望
+1. 作者原文自述的研究不足、试验条件限制、体系适用范围短板
+2. 实验设计、数据完整性、机理深度等潜在问题，统一标注**合理推断**
+3. 作者规划后续研究方向、优化思路与拓展应用前景
 
-## Module G — 原文精要
-<用 ≤300 字概括核心结论，保留关键数据点>
-
-图表深度读取指引：
-【谱图类】记录特征峰位置与归属，衍生参数 vs 文本值，检查异常峰
-【显微/影像类】目估特征尺寸及分布均匀性，测量标注尺度并与文本对比
-【性能曲线】直接取关键数据点，核对文中数字，评估趋势与稳定性
-【统计图表】核读均值/误差/显著性，判断是否支持文本定性结论
-【拟合/回归图】提取拟合参数验证记载，检查异常离群数据点
-【表格】逐行扫描，核对文中所有引用数字，记录脚注条件
-
-完成后逐项核查：数值溯源 / 措辞合规 / 图表全覆盖 / 引号精确匹配 / 无占位符`;
+### 7. 全文高度摘要
+字数≤300字，完整概括研究背景、实验思路、核心规律、关键数据与最终研究结论`;
 
   // ==================== 配置 ====================
   // PROMPT_POOL and rotation
@@ -1404,7 +1387,7 @@
     panel.id = PANEL_ID;
     panel.innerHTML =
 '<div class="qw-header" id="qw-header-drag">'+
-' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.1.0</span>'+
+' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.1.1</span>'+
 ' <span class="qw-header-spacer"></span>'+
 ' <button class="qw-header-btn" id="qw-btn-minimize" title="最小化">−</button>'+
 '</div>'+
@@ -1440,7 +1423,7 @@
 '  <div class="qw-section-title">📝 Prompt模板 (轮换)</div>'+
 '  <div style="display:flex;gap:2px;margin-bottom:2px;"><span class="qw-prompt-tab active" data-tab="0">#0</span><span class="qw-prompt-tab" data-tab="1">#1</span></div>'+
 '  <textarea id="qw-textarea-prompt" style="width:100%;height:60px;background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:0 6px 6px 6px;padding:6px 10px;font-size:11px;line-height:1.4;resize:vertical">'+escHtml(cfg.promptText||DEFAULT_PROMPT)+'</textarea>'+
-'  <div class="qw-row" style="gap:6px;margin-top:2px;"><label style="color:#aaa;font-size:11px;display:flex;align-items:center;gap:3px;"><input type="checkbox" id="qw-checkbox-auto-rotate" checked> 自动轮换</label><span style="color:#6a6a8a;font-size:10px;" id="qw-rotate-index">轮换: -</span></div>'+
+'  <div class="qw-row" style="gap:6px;margin-top:2px;"><label style="color:#aaa;font-size:11px;display:flex;align-items:center;gap:3px;"><input type="checkbox" id="qw-checkbox-auto-rotate"> 自动轮换</label><span style="color:#6a6a8a;font-size:10px;" id="qw-rotate-index">轮换: -</span></div>'+
 '  <div class="qw-row" style="gap:6px"><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-save-prompt">保存</button><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-reset-prompt">恢复默认</button></div>'+
 ' </div>'+
 ' <hr class="qw-divider">'+
@@ -1463,7 +1446,7 @@
 ' </div>'+
 ' <div class="qw-row" style="gap:4px;margin-top:4px;"><input type="text" id="qw-input-range" style="flex:1;background:#16213e;border:1px solid #2a2a4a;color:#e0e0e0;border-radius:6px;padding:4px 8px;font-size:11px;" placeholder="按序号: 1,3,5-10"><button class="qw-btn qw-btn-outline qw-btn-sm" id="qw-btn-upload-range">上传指定</button></div>'+
 ' <hr class="qw-divider">'+
-' <div class="qw-section"><div class="qw-section-title">📜 日志</div><div class="qw-log-container" id="qw-log-container"><div class="qw-log-entry qw-log-info">🚀 Pro v4.1.0 已启动</div><div class="qw-log-entry qw-log-info">📌 选择文件夹或拖拽PDF开始</div></div></div>'+
+' <div class="qw-section"><div class="qw-section-title">📜 日志</div><div class="qw-log-container" id="qw-log-container"><div class="qw-log-entry qw-log-info">🚀 Pro v4.1.1 已启动</div><div class="qw-log-entry qw-log-info">📌 选择文件夹或拖拽PDF开始</div></div></div>'+
 '</div>';
     document.body.appendChild(panel);
 
@@ -1695,7 +1678,7 @@
     loadPersistedLog();
     var c=getConfig(),ch=false;
     if(!c.cooldownMinutes){c.cooldownMinutes=120;ch=true;}
-    if(!c.autoRotateEnabled&&c.autoRotateEnabled!==false){c.autoRotateEnabled=true;ch=true;}
+    if(c.autoRotateEnabled===undefined){c.autoRotateEnabled=false;ch=true;}
     if(ch)saveConfig();
     STATE.lastSavedHash='';STATE.processedHashes=[];STATE.baselineFingerprints=new Set();
     STATE.prompt_index=gmGet('prompt_index',0);
@@ -1703,7 +1686,7 @@
     // create panel first so ui exists for logging
     createPanel();
     updateRotateIndex();
-    log('v4.1.0 started','info');log('fetch hijack active','info');
+    log('v4.1.1 started','info');log('fetch hijack active','info');
 
     // restore persisted logs to panel
     if(STATE.logBuffer.length>0&&STATE.ui.logContainer){
