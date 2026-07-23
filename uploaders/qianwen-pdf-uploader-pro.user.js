@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         千问 PDF 批量上传器 Pro
 // @namespace    https://github.com/qclaw/qianwen-pdf-uploader
-// @version      4.3.0
-// @description  v4.3.0: 纯DOM通道|input.click+showPicker劫持|无网络拦截|修复文件注入
+// @version      4.3.1
+// @description  v4.3.1: 增强文件注入(MutationObserver自动发现+重试)|纯DOM通道|无网络拦截
 // @author       QClaw
 // @match        https://www.qianwen.com/*
 // @match        https://qianwen.com/*
@@ -315,6 +315,10 @@
     for (var i = 0; i < inputs.length; i++) {
       if (!inside(inputs[i])) return inputs[i];
     }
+    var allInputs = document.querySelectorAll('input');
+    for (var j = 0; j < allInputs.length; j++) {
+      if (allInputs[j].type === 'file' && !inside(allInputs[j])) return allInputs[j];
+    }
     return null;
   }
 
@@ -338,17 +342,18 @@
   var _origSOFP = null;
   var _origInputClick = null;
   var _origShowPicker = null;
+  var _inputObserver = null;
 
   function _doInject(f) {
     try {
       var inp = findFileInput();
       if (inp && setFileToInput(inp, f)) { _pwPendingFile = null; return true; }
-      var all = document.querySelectorAll('input[type="file"]');
+      var all = document.querySelectorAll('input');
       for (var i = 0; i < all.length; i++) {
+        if (all[i].type !== 'file') continue;
         if (all[i].files && all[i].files.length > 0) continue;
         if (setFileToInput(all[i], f)) { _pwPendingFile = null; return true; }
       }
-      // 兜底: 创建临时 input
       var tmp = document.createElement('input');
       tmp.type = 'file'; tmp.multiple = true;
       if (setFileToInput(tmp, f)) {
@@ -362,9 +367,27 @@
     return false;
   }
 
+  function _startInputObserver() {
+    if (_inputObserver) return;
+    _inputObserver = new MutationObserver(function() {
+      if (!_pwPendingFile || _pwInjected) return;
+      var inp = findFileInput();
+      if (inp && !inp.files.length) {
+        log('Observer auto-injected file', 'info');
+        setFileToInput(inp, _pwPendingFile);
+        _pwInjected = true;
+      }
+    });
+    _inputObserver.observe(document.body, { childList: true, subtree: true });
+  }
+  function _stopInputObserver() {
+    if (_inputObserver) { _inputObserver.disconnect(); _inputObserver = null; }
+  }
+
   function patchFileInputHooks(fileObj) {
     _pwPendingFile = fileObj;
     _pwInjected = false;
+    _startInputObserver();
 
     if (!_origSOFP) _origSOFP = window.showOpenFilePicker;
     window.showOpenFilePicker = function(opts) {
@@ -985,7 +1008,7 @@
     panel.id = PANEL_ID;
     panel.innerHTML =
 '<div class="qw-header" id="qw-header-drag">'+
-' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.3.0</span>'+
+' <span class="qw-header-icon">🌐</span><span class="qw-header-text">千问 PDF 批量上传器 Pro v4.3.1</span>'+
 ' <span class="qw-header-spacer"></span>'+
 ' <button class="qw-header-btn" id="qw-btn-minimize" title="最小化">−</button>'+
 '</div>'+
