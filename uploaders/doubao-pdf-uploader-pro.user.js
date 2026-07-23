@@ -1214,7 +1214,7 @@
                 if (isInsideOurPanel(box)) continue;
                 const text = (box.textContent || '').trim();
                 if (text.length < 200) continue;
-                if (text.startsWith('你是 ') || text.includes('<标题/作者')) continue;
+                if (text.startsWith('你是 ') || text.startsWith('## 角色设定') || text.startsWith('## 角色设定') || text.includes('<标题/作者')) continue;
                 if (text.includes('历史对话') || text.includes('搜索')) continue;
                 const fp = hashText(text);
                 if (fingerprints.has(fp)) continue;
@@ -1279,7 +1279,7 @@
                     if (!mdBox || isInsideOurPanel(mdBox)) continue;
                     const text = (mdBox.textContent || '').trim();
                     if (text.length < 50) continue;
-                    if (text.startsWith('你是 ')) continue;
+                    if (text.startsWith('你是 ') || text.startsWith('## 角色设定')) continue;
                     if (text.includes('<标题/作者')) continue;
                     const fp = hashText(text);
                     if (fingerprints.has(fp)) continue;
@@ -1295,7 +1295,7 @@
                     if (isInsideOurPanel(box)) continue;
                     const text = (box.textContent || '').trim();
                     if (text.length < 100) continue;
-                    if (text.startsWith('你是 ') || text.includes('<标题/作者')) continue;
+                    if (text.startsWith('你是 ') || text.startsWith('## 角色设定') || text.startsWith('## 角色设定') || text.includes('<标题/作者')) continue;
                     if (text.includes('历史对话') || text.includes('搜索')) continue;
                     const fp = hashText(text);
                     if (fingerprints.has(fp)) continue;
@@ -1307,7 +1307,7 @@
             if (newMsg && newMsgText.length > 50) {
                 const currentLength = newMsgText.length;
                 const preview = newMsgText.substring(0, 100);
-                if (preview.includes('你是 ') && (preview.includes('研究员') || preview.includes('工程师'))) {
+                if (preview.includes('你是 ') || preview.startsWith('## 角色设定') || preview.includes('## 严格执行准则')) {
                     newMsg = null; newMsgText = ''; lastTextLength = 0; stableCount = 0;
                     await sleep(CHECK_INTERVAL); continue;
                 }
