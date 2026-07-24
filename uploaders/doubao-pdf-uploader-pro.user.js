@@ -1257,7 +1257,7 @@
                 if (isInsideOurPanel(box)) continue;
                 const text = (box.textContent || '').trim();
                 if (text.length < 200) continue;
-                if (text.startsWith('你是 ') || text.startsWith('## 角色设定') || text.startsWith('## 角色设定') || text.includes('<标题/作者')) continue;
+                if (text.startsWith('## 角色设定') || text.startsWith('你是 ') || text.includes('<标题/作者')) continue;
                 if (text.includes('历史对话') || text.includes('搜索')) continue;
                 const fp = hashText(text);
                 if (fingerprints.has(fp)) continue;
@@ -1338,7 +1338,7 @@
                     if (isInsideOurPanel(box)) continue;
                     const text = (box.textContent || '').trim();
                     if (text.length < 100) continue;
-                    if (text.startsWith('你是 ') || text.startsWith('## 角色设定') || text.startsWith('## 角色设定') || text.includes('<标题/作者')) continue;
+                    if (text.startsWith('## 角色设定') || text.startsWith('你是 ') || text.includes('<标题/作者')) continue;
                     if (text.includes('历史对话') || text.includes('搜索')) continue;
                     const fp = hashText(text);
                     if (fingerprints.has(fp)) continue;
