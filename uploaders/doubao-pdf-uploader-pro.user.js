@@ -1061,54 +1061,34 @@
 
     // ==================== 回答质量验证 ====================
     /**
-     * 结构化验证：判断捕获内容真的是 AI 精读笔记，还是误捕获的用户 Prompt / 错误信息。
-     * 只做实质性判断——必须出现真实学术文献的典型特征，缺一不可。
+     * v4.5.0 简化验证：排除 Prompt 回声后仅做基础长度检查。
+     * 严格的结构化验证（DOI/期刊/作者/章节计数）容易因 AI 排版变化
+     * 误判有效回答，反而造成冷却+唤醒的不必要中断。真实的 Prompt 泄漏
+     * 已在捕获层通过 isAssistantEl + Prompt 文本过滤解决。
      */
     function isValidResponse(text, promptText, useDefaultBtn) {
         if (!text || text.length < 500) {
             return { valid: false, reason: '内容过短 (' + (text ? text.length : 0) + ' 字符, 需>=500)' };
         }
-        // ━━ 排除用户 Prompt 回声 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        // 用户 Prompt 以"角色设定"开头，AI 回答不会出现这些指令原文
+        // 排除用户 Prompt 回声
         if (/^#{1,3}\s*角色设定/m.test(text)) {
             return { valid: false, reason: '检测到用户 Prompt 回声（角色设定）' };
         }
-        // 用户 Prompt 包含未填充的占位符模板，AI 回答会填实
-        if (/<标题\/作者\/机构/.test(text) || /<制备条件/.test(text)) {
+        if (/<标题\/作者\/机构/.test(text)) {
             return { valid: false, reason: '检测到未填充的 Prompt 占位符模板' };
         }
-        // ━━ 排除平台拒绝 / 错误 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 排除平台拒绝 / 错误
         const refuse = [
             /抱歉.{0,20}(无法|不能).{0,20}(处理|读取|识别|访问)/,
             /I('m| am) sorry.{0,30}(cannot|unable)/i,
-            /请提供.{0,10}(文件|文档|PDF|内容)/,
-            /Please (upload|provide|attach).{0,15}(file|document)/i,
             /(错误|异常).{0,10}(处理|读取|上传|生成)/,
-            /(服务|系统).{0,10}(繁忙|拥挤|不可用|暂时)/,
         ];
         for (const p of refuse) {
             if (p.test(text)) {
                 return { valid: false, reason: '检测到拒绝/错误: ' + text.substring(0, 80).replace(/\n/g, ' ') };
             }
         }
-        // ━━ 正向验证：必须包含真实学术笔记特征 ━━━━━━━━━━━━━━━━━━━━━━
-        // 1. 必须出现真实的文献基本信息（DOI 或具体期刊或作者+机构）
-        const hasDOI = /DOI[：:\s]*10\.\d{4,}/i.test(text);
-        const hasJournal = /期刊[：:\s]*[A-Z].{3,}(et al|Vol|vol|\(\d{4}\))/.test(text)
-                        || /[A-Z][a-z]+ [A-Z][a-z]+.{0,40}\d{4}/.test(text.substring(0, 2000));
-        const hasAuthor = /(作者|Authors?)[：:\s]*[A-Z一-鿿]{2,}/.test(text)
-                       || /(第一作者|通讯|通讯作者|Corresponding)/.test(text);
-        if (!hasDOI && !hasJournal && !hasAuthor) {
-            return { valid: false, reason: '未检测到真实文献引用信息（DOI/期刊/作者均缺失）' };
-        }
-        // 2. 至少出现 4 个 7 段结构中的章节标题（已填充内容的）
-        const _sRe = /^(?:#{1,4}\s*(?:[1-7]\.?\s*)?|▎\d\.?\s*|【.*】)(?:文献(?:基本信息|卡片|档案|概览)|研究(?:背景|动机)|(?:科学|研究)?问题|方法|(?:实验|研究)?(?:方法|路线|方案)|(?:技术|工艺)路线|(?:核心|主要)?(?:结果|发现)|(?:创新|贡献|(?:技术)?亮点)|局限|展望|(?:原文|全文)?(?:摘要|精要|总结|速览))/gm;
-        const sections = text.match(_sRe);
-        const secCount = sections ? sections.length : 0;
-        if (secCount < 4 && text.length < 8000) {
-            return { valid: false, reason: '7段结构章节标题不足(' + secCount + '/4)，可能是非结构化内容' };
-        }
-        return { valid: true, reason: '有效精读笔记 (' + text.length + ' 字符, ' + secCount + '/7 章节)' };
+        return { valid: true, reason: '有效回答 (' + text.length + ' 字符)' };
     }
 
     // ==================== 等待 AI 回答完成 ====================
