@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM-Wiki Knowledge Fusion — 免费AI文献批量精读</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;background:linear-gradient(135deg,#0a0a1a 0%,#1a1a2e 100%);color:#e0e0e0;min-height:100vh}
+.hero{padding:80px 20px 60px;text-align:center;background:linear-gradient(135deg,#16213e 0%,#1a1a2e 100%);border-bottom:1px solid #2a2a4a}
+.hero h1{font-size:2.5em;font-weight:800;background:linear-gradient(90deg,#4a6cf7,#10b981);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:16px}
+.hero p{font-size:1.2em;color:#aaa;max-width:700px;margin:0 auto;line-height:1.8}
+.badge{display:inline-block;padding:6px 16px;border-radius:20px;font-size:.85em;font-weight:600;margin:8px;border:1px solid}
+.badge-free{background:rgba(16,185,129,.15);color:#10b981;border-color:#10b981}
+.badge-open{background:rgba(74,108,247,.15);color:#4a6cf7;border-color:#4a6cf7}
+.cta{margin:40px 0 0}
+.cta a{display:inline-block;padding:14px 36px;border-radius:8px;font-size:1.1em;font-weight:600;text-decoration:none;margin:0 10px;transition:all .3s}
+.btn-primary{background:linear-gradient(135deg,#4a6cf7,#2563eb);color:#fff;box-shadow:0 4px 20px rgba(74,108,247,.4)}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 6px 30px rgba(74,108,247,.6)}
+.btn-outline{background:transparent;border:2px solid #4a6cf7;color:#4a6cf7}
+.btn-outline:hover{background:rgba(74,108,247,.1)}
+.container{max-width:1100px;margin:0 auto;padding:50px 20px}
+.section-title{font-size:1.8em;font-weight:700;margin:40px 0 20px;color:#fff}
+.pipeline{display:flex;justify-content:center;align-items:center;flex-wrap:wrap;gap:20px;padding:30px;background:rgba(22,33,62,.5);border-radius:16px;margin:30px 0}
+.pipestep{text-align:center;padding:20px;background:#1a1a2e;border-radius:12px;border:1px solid #2a2a4a;min-width:160px}
+.pipestep .num{display:inline-block;width:32px;height:32px;line-height:32px;border-radius:50%;background:linear-gradient(135deg,#4a6cf7,#10b981);font-weight:700;font-size:.9em;margin-bottom:10px}
+.pipestep .title{font-weight:600;margin-bottom:6px}
+.pipestep .desc{font-size:.8em;color:#aaa}
+.pipearrow{font-size:2em;color:#4a6cf7}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin:30px 0}
+.card{background:#16213e;border-radius:12px;padding:24px;border:1px solid #2a2a4a;transition:transform .2s,box-shadow .2s}
+.card:hover{transform:translateY(-3px);box-shadow:0 8px 30px rgba(0,0,0,.3)}
+.card h3{font-size:1.2em;margin-bottom:12px;display:flex;align-items:center;gap:10px}
+.card .icon{font-size:1.4em}
+.card p{color:#aaa;line-height:1.6;font-size:.95em}
+.card .tag{display:inline-block;padding:3px 10px;border-radius:12px;font-size:.75em;font-weight:600;margin-top:12px}
+.tag-doubao{background:rgba(74,108,247,.2);color:#4a6cf7}
+.tag-qianwen{background:rgba(16,185,129,.2);color:#10b981}
+.tag-deepseek{background:rgba(245,158,11,.2);color:#f59e0b}
+.install{background:linear-gradient(135deg,rgba(74,108,247,.1),rgba(16,185,129,.1));border:1px solid #2a2a4a;border-radius:12px;padding:30px;margin:30px 0}
+.install ol{margin:12px 0 0 20px;line-height:2;color:#ccc}
+.features{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:30px 0}
+.feat{padding:16px;background:rgba(22,33,62,.3);border-radius:8px;border:1px solid #2a2a4a;font-size:.9em}
+.feat strong{color:#e0e0e0;display:block;margin-bottom:4px}
+.feat span{color:#aaa;font-size:.85em}
+.footer{text-align:center;padding:40px 20px;color:#6a6a8a;font-size:.85em;border-top:1px solid #1a1a2e}
+.footer a{color:#4a6cf7;text-decoration:none}
+@media(max-width:768px){.hero h1{font-size:1.6em}.pipestep{min-width:120px;padding:14px}.cards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>LLM-Wiki Knowledge Fusion</h1>
+  <p>免费的 AI 文献批量自动精读工具包 &mdash; 用豆包 / 千问 / DeepSeek <strong>网页版</strong>免费额度，批量精读 PDF 文献，产出结构化笔记，再融合成可检索、可视化的三层知识库</p>
+  <div style="margin-top:24px">
+    <span class="badge badge-free">&#x1F193; 零成本，无需 API Key</span>
+    <span class="badge badge-open">&#x1F4D6; 开源 MIT 协议</span>
+  </div>
+  <div class="cta">
+    <a href="https://github.com/13145211/llm-wiki-knowledge-fusion" class="btn-primary">&#x2B50; GitHub 仓库</a>
+    <a href="#install" class="btn-outline">&#x1F4E5; 快速安装</a>
+  </div>
+</div>
+
+<div class="container">
+
+  <h2 class="section-title">&#x1F504; 工作流</h2>
+  <div class="pipeline">
+    <div class="pipestep"><div class="num">1</div><div class="title">选择PDF文件夹</div><div class="desc">或拖拽批量导入</div></div>
+    <div class="pipearrow">&rarr;</div>
+    <div class="pipestep"><div class="num">2</div><div class="title">自动精读</div><div class="desc">上传 + Prompt + 等待 + 校验 + 保存</div></div>
+    <div class="pipearrow">&rarr;</div>
+    <div class="pipestep"><div class="num">3</div><div class="title">知识编译</div><div class="desc">concepts / entities / methods</div></div>
+    <div class="pipearrow">&rarr;</div>
+    <div class="pipestep"><div class="num">4</div><div class="title">图谱索引</div><div class="desc">Obsidian + GBrain</div></div>
+  </div>
+
+  <h2 class="section-title">&#x1F4E6; 浏览器精读脚本</h2>
+  <div class="cards">
+    <div class="card">
+      <h3><span class="icon">&#x1F4C1;</span> 豆包 PDF 批量上传器 Pro</h3>
+      <p>SSE 流拦截 + MutationObserver 加速完成判定、平台默认总结按钮模式</p>
+      <div class="tag tag-doubao">v4.5.0 &middot; doubao.com</div>
+    </div>
+    <div class="card">
+      <h3><span class="icon">&#x1F310;</span> 千问 PDF 批量上传器 Pro</h3>
+      <p>showOpenFilePicker 劫持注入文件、网络拦截 + DOM 双通道取回答、动态Prompt防御</p>
+      <div class="tag tag-qianwen">v4.2.0 &middot; qianwen.com</div>
+    </div>
+    <div class="card">
+      <h3><span class="icon">&#x1F40B;</span> DeepSeek PDF 批量上传器</h3>
+      <p>自适应 DOM 探测、深度思考模式开关、思考链内容排除</p>
+      <div class="tag tag-deepseek">v1.1.0 &middot; chat.deepseek.com</div>
+    </div>
+  </div>
+
+  <h2 class="section-title">&#x2728; 核心能力</h2>
+  <div class="features">
+    <div class="feat"><strong>&#x1F501; 批量队列</strong><span>文件夹选择或拖拽，跨会话断点续传</span></div>
+    <div class="feat"><strong>&#x1F4DD; Prompt 智能管理</strong><span>多角色变体轮换，动态isPrompt防御泄漏</span></div>
+    <div class="feat"><strong>&#x2705; 回答质量校验</strong><span>无效回答自动冷却 + 日常问题唤醒恢复</span></div>
+    <div class="feat"><strong>&#x1F4BE; 自动保存</strong><span>.md 笔记 + 剪贴板保底，文件名可追溯</span></div>
+    <div class="feat"><strong>&#x23F0; 时间窗口</strong><span>只在你设定的时段运行，窗口外自动暂停</span></div>
+    <div class="feat"><strong>&#x1F4DC; 持久化日志</strong><span>导出/导入进度报告，换电脑也能恢复</span></div>
+    <div class="feat"><strong>&#x1F3AF; 精细控制</strong><span>按序号上传、点选上传、失败一键重试</span></div>
+    <div class="feat"><strong>&#x1F9E0; 三层知识库</strong><span>精读笔记 &rarr; LLM-Wiki &rarr; GBrain图谱</span></div>
+  </div>
+
+  <div id="install" class="install">
+    <h2>&#x1F4E5; 安装使用</h2>
+    <ol>
+      <li>浏览器安装 <a href="https://www.tampermonkey.net/" style="color:#4a6cf7">Tampermonkey</a> 扩展 (Edge / Chrome)</li>
+      <li>打开 <a href="https://github.com/13145211/llm-wiki-knowledge-fusion/tree/main/uploaders" style="color:#10b981">uploaders/</a> 目录，下载对应平台的 .user.js 文件</li>
+      <li>Tampermonkey 自动弹出安装页 &rarr; 确认安装</li>
+      <li>访问 AI 平台网页版并登录 &rarr; 页面右上角出现控制面板 &rarr; 选择 PDF 文件夹 &rarr; 开始批量精读</li>
+      <li>精读笔记攒够了？下载 <a href="https://github.com/13145211/llm-wiki-knowledge-fusion/releases" style="color:#4a6cf7">llm-wiki-knowledge-fusion.skill</a> 建立三层知识库</li>
+    </ol>
+  </div>
+
+  <h2 class="section-title">&#x26A0;&#xFE0F; 免责声明</h2>
+  <p style="color:#aaa;line-height:1.8">本工具通过模拟操作驱动 AI 平台<strong>网页版</strong>，仅供<strong>个人学习与文献管理</strong>使用。请遵守各平台服务条款；高频自动化操作可能触发平台风控，请合理设置上传间隔与时间窗口。脚本不收集、不上传任何数据到第三方；所有笔记只保存在你的本地。</p>
+
+  <h2 class="section-title">&#x1F4C4; License</h2>
+  <p style="color:#aaa"><a href="https://github.com/13145211/llm-wiki-knowledge-fusion/blob/main/LICENSE" style="color:#4a6cf7">MIT</a> &copy; 2026 QClaw</p>
+
+</div>
+
+<div class="footer">
+  <p>&#x1F193; 完全免费，零成本学术自动化 &middot; <a href="https://github.com/13145211/llm-wiki-knowledge-fusion">GitHub</a></p>
+</div>
+
+</body>
+</html>
