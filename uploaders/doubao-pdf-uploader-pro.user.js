@@ -1104,8 +1104,8 @@
         // 2. 至少出现 4 个 7 段结构中的章节标题（已填充内容的）
         const _sRe = /^(?:#{1,4}\s*(?:[1-7]\.?\s*)?|▎\d\.?\s*|【.*】)(?:文献(?:基本信息|卡片|档案|概览)|研究(?:背景|动机)|(?:科学|研究)?问题|方法|(?:实验|研究)?(?:方法|路线|方案)|(?:技术|工艺)路线|(?:核心|主要)?(?:结果|发现)|(?:创新|贡献|(?:技术)?亮点)|局限|展望|(?:原文|全文)?(?:摘要|精要|总结|速览))/gm;
         const sections = text.match(_sRe);
+        const secCount = sections ? sections.length : 0;
         if (secCount < 4 && text.length < 8000) {
-            // Short texts need 4 sections; very long texts (>8k chars) likely passed other checks
             return { valid: false, reason: '7段结构章节标题不足(' + secCount + '/4)，可能是非结构化内容' };
         }
         return { valid: true, reason: '有效精读笔记 (' + text.length + ' 字符, ' + secCount + '/7 章节)' };
