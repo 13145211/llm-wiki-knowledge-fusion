@@ -64,7 +64,9 @@
         processedHashes: [],
         baselineFingerprints: new Set(),
         // Prompt 轮换
-        prompt_index: 0
+        prompt_index: 0,
+        // v4.5.0: 记录本次发送的 prompt 文本，用于动态 isPrompt 防御
+        lastSentPrompt: ''
     };
 
     // ==================== GM 存储封装 ====================
@@ -76,6 +78,64 @@
 
     function gmSet(key, value) {
         GM_setValue(STORE_PREFIX + key, JSON.stringify(value));
+    }
+
+    // ==================== ★ v4.5.0 Prompt 泄漏防御层 ====================
+
+    function extractPromptFeatures(promptText) {
+        if (!promptText) return [];
+        var features = [];
+        var headingMatches = promptText.match(/#{1,4}\s+[^\n]{2,50}/g);
+        if (headingMatches) {
+            for (var i = 0; i < headingMatches.length && features.length < 15; i++) {
+                features.push(headingMatches[i].trim());
+            }
+        }
+        var lines = promptText.split('\n');
+        for (var j = 0; j < lines.length && features.length < 30; j++) {
+            var line = lines[j].trim();
+            if (line.length < 6 || line.length > 80) continue;
+            if (/^[\d\.\-\*\#\s]+$/.test(line)) continue;
+            if (/(角色|设定|准则|严格执行|绝不|编造|杜撰|冲突|以.*为准|注明|标注|来源|Fig|Table|系统性|深度|识别|解读|不遗漏|不局限|客观|中立|有据|探明|验证|得出|首次|突破|开创|绝对|夸张|原文|原话|引用|合理推断|原文未说明|潜在|规划|后续|优化|拓展|前景|高度摘要|概括)/.test(line)) {
+                features.push(line.substring(0, 60));
+            }
+        }
+        return features;
+    }
+
+    function isPrompt(text) {
+        if (!text || text.length < 30) return false;
+        var promptText = STATE.lastSentPrompt || getConfig().promptText || DEFAULT_PROMPT;
+        var features = extractPromptFeatures(promptText);
+        if (features.length === 0) return false;
+        var hits = 0;
+        for (var i = 0; i < features.length; i++) {
+            if (text.indexOf(features[i]) >= 0) hits++;
+            if (hits >= 3) return true;
+        }
+        if (features.length > 0 && hits / features.length > 0.3) return true;
+        return false;
+    }
+
+    function isTextSimilarToPrompt(text, prompt) {
+        if (!text || !prompt) return false;
+        var tl = text.toLowerCase(), pl = prompt.toLowerCase();
+        if (pl.length > 200) {
+            if (tl.indexOf(pl.substring(0, 200)) >= 0) return true;
+            var mid = Math.floor(pl.length / 2);
+            if (tl.indexOf(pl.substring(mid, mid + 200)) >= 0) return true;
+            if (tl.indexOf(pl.substring(pl.length - 200)) >= 0) return true;
+        }
+        var features = extractPromptFeatures(prompt);
+        if (features.length > 0) {
+            var shared = 0;
+            for (var i = 0; i < features.length; i++) {
+                if (tl.indexOf(features[i].toLowerCase()) >= 0) shared++;
+            }
+            if (shared / features.length > 0.4) return true;
+            if (shared > 5) return true;
+        }
+        return false;
     }
 
     // ==================== 默认 Prompt ====================
@@ -1070,21 +1130,17 @@
         if (!text || text.length < 500) {
             return { valid: false, reason: '内容过短 (' + (text ? text.length : 0) + ' 字符, 需>=500)' };
         }
-        // 排除用户 Prompt 回声
-        if (/^#{1,3}\s*角色设定/m.test(text)) {
-            return { valid: false, reason: '检测到用户 Prompt 回声（角色设定）' };
-        }
-        if (/<标题\/作者\/机构/.test(text)) {
-            return { valid: false, reason: '检测到未填充的 Prompt 占位符模板' };
-        }
+        // ★ v4.5.0: 动态 isPrompt 检测
+        if (isPrompt(text)) return { valid: false, reason: 'is_prompt' };
+        if (promptText && isTextSimilarToPrompt(text, promptText)) return { valid: false, reason: 'similar_to_prompt' };
         // 排除平台拒绝 / 错误
-        const refuse = [
+        var refuse = [
             /抱歉.{0,20}(无法|不能).{0,20}(处理|读取|识别|访问)/,
             /I('m| am) sorry.{0,30}(cannot|unable)/i,
             /(错误|异常).{0,10}(处理|读取|上传|生成)/,
         ];
-        for (const p of refuse) {
-            if (p.test(text)) {
+        for (var ri = 0; ri < refuse.length; ri++) {
+            if (refuse[ri].test(text)) {
                 return { valid: false, reason: '检测到拒绝/错误: ' + text.substring(0, 80).replace(/\n/g, ' ') };
             }
         }
@@ -1257,7 +1313,7 @@
                 if (isInsideOurPanel(box)) continue;
                 const text = (box.textContent || '').trim();
                 if (text.length < 200) continue;
-                if (text.startsWith('## 角色设定') || text.startsWith('你是 ') || text.includes('<标题/作者')) continue;
+                if (isPrompt(text)) continue;
                 if (text.includes('历史对话') || text.includes('搜索')) continue;
                 const fp = hashText(text);
                 if (fingerprints.has(fp)) continue;
@@ -1322,8 +1378,7 @@
                     if (!mdBox || isInsideOurPanel(mdBox)) continue;
                     const text = (mdBox.textContent || '').trim();
                     if (text.length < 50) continue;
-                    if (text.startsWith('你是 ') || text.startsWith('## 角色设定')) continue;
-                    if (text.includes('<标题/作者')) continue;
+                    if (isPrompt(text)) continue;
                     const fp = hashText(text);
                     if (fingerprints.has(fp)) continue;
                     if (text.length > newMsgText.length) { newMsgText = text; newMsg = mdBox; }
@@ -1338,7 +1393,7 @@
                     if (isInsideOurPanel(box)) continue;
                     const text = (box.textContent || '').trim();
                     if (text.length < 100) continue;
-                    if (text.startsWith('## 角色设定') || text.startsWith('你是 ') || text.includes('<标题/作者')) continue;
+                    if (isPrompt(text)) continue;
                     if (text.includes('历史对话') || text.includes('搜索')) continue;
                     const fp = hashText(text);
                     if (fingerprints.has(fp)) continue;
@@ -1350,7 +1405,7 @@
             if (newMsg && newMsgText.length > 50) {
                 const currentLength = newMsgText.length;
                 const preview = newMsgText.substring(0, 100);
-                if (preview.includes('你是 ') || preview.startsWith('## 角色设定') || preview.includes('## 严格执行准则')) {
+                if (isPrompt(newMsgText)) {
                     newMsg = null; newMsgText = ''; lastTextLength = 0; stableCount = 0;
                     await sleep(CHECK_INTERVAL); continue;
                 }
@@ -1667,7 +1722,9 @@
                 const autoPromptOn = config.autoPrompt !== false;
                 if (autoPromptOn && config.promptText) {
                     log('📝 自动 Prompt 已开启，开始输入...', 'info');
-                    promptEntered = await typePromptIntoChat(getRotatedPrompt());
+                    var sentPrompt = getRotatedPrompt();
+                    STATE.lastSentPrompt = sentPrompt;
+                    promptEntered = await typePromptIntoChat(sentPrompt);
                     if (promptEntered) {
                         const promptDoneSec = config.promptDoneWaitSeconds || DEFAULT_PROMPT_DONE_WAIT_SECONDS;
                         const promptDoneWait = promptDoneSec * 1000 + Math.random() * 500;
